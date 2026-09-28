@@ -15,6 +15,9 @@ import { bernardToken } from "./session.js";
 const BASE = "https://api.bernard.swisscom.com/v1";
 const RUN_URL = `${BASE}/agents/run`;
 const MAX_IMAGES = 5;
+// /v1/agents/run validates `message` at 50,000 characters, independently of the model context window.
+const MAX_MESSAGE_CHARS = 48_000;
+const MAX_SYSTEM_CHARS = 16_000;
 const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const imageResize = { maxWidth: 2000, maxHeight: 2000, maxBytes: 10 * 1024 * 1024, jpegQuality: 80 };
 const modes = new Map<string, string[]>();
@@ -85,27 +88,62 @@ function thinkingMode(modelId: string, level?: string): string | undefined {
   return supported.filter((mode) => mode !== "off").at(-1);
 }
 
-function transcriptToText(context: TranscriptContext): string {
-  return context.messages.map((message) => {
-    if (message.role === "system") {
-      const text = typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join("\n");
-      const sections = Object.entries(message.sections ?? {})
-        .filter(([name, value]) => name !== "tools" && Boolean(value))
-        .map(([, value]) => value)
-        .join("\n");
-      return `[SYSTEM]\n${text}\n${sections}`;
+function clipMiddle(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const marker = "\n[… content omitted to fit Bernard's 50,000-character transport limit …]\n";
+  const available = Math.max(0, limit - marker.length);
+  const start = Math.ceil(available * 0.6);
+  return value.slice(0, start) + marker + value.slice(value.length - (available - start));
+}
+
+function renderMessage(message: TranscriptContext["messages"][number]): string {
+  if (message.role === "system") {
+    const text = typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join("\n");
+    const sections = Object.entries(message.sections ?? {})
+      .filter(([name, value]) => name !== "tools" && Boolean(value))
+      .map(([, value]) => value)
+      .join("\n");
+    return `[SYSTEM]\n${text}\n${sections}`;
+  }
+  if (message.role === "toolResult") {
+    return `[TOOL RESULT: ${message.toolName}]\n${message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")}`;
+  }
+  const text = typeof message.content === "string" ? message.content : message.content.map((part) => {
+    if (part.type === "text") return part.text;
+    if (part.type === "image") return "[Image attached to this turn]";
+    if (part.type === "toolCall") return `[Tool call ${part.name}: ${JSON.stringify(part.arguments)}]`;
+    return "";
+  }).join("\n");
+  return `[${message.role.toUpperCase()}]\n${text}`;
+}
+
+function transcriptToText(context: TranscriptContext): { text: string; sourceTokens: number } {
+  const rendered = context.messages.map(renderMessage);
+  const trailer = "Reply to the last USER message, respecting the SYSTEM instructions above.";
+  const full = rendered.join("\n\n") + `\n\n${trailer}`;
+  const sourceTokens = Math.ceil(full.length / 4);
+  if (full.length <= MAX_MESSAGE_CHARS) return { text: full, sourceTokens };
+
+  const systemIndex = context.messages.findIndex((message) => message.role === "system");
+  const system = systemIndex >= 0 ? clipMiddle(rendered[systemIndex], MAX_SYSTEM_CHARS) : "";
+  const omission = "[Earlier conversation omitted because Bernard limits each run message to 50,000 characters.]";
+  const fixedLength = system.length + trailer.length + omission.length + 8;
+  let remaining = Math.max(0, MAX_MESSAGE_CHARS - fixedLength);
+  const recent: string[] = [];
+  for (let index = rendered.length - 1; index >= 0 && remaining > 0; index--) {
+    if (index === systemIndex) continue;
+    const separator = recent.length ? 2 : 0;
+    if (rendered[index].length + separator <= remaining) {
+      recent.unshift(rendered[index]);
+      remaining -= rendered[index].length + separator;
+    } else {
+      // Always preserve both the beginning and end of the newest oversized turn.
+      if (!recent.length) recent.unshift(clipMiddle(rendered[index], remaining));
+      break;
     }
-    if (message.role === "toolResult") {
-      return `[TOOL RESULT: ${message.toolName}]\n${message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")}`;
-    }
-    const text = typeof message.content === "string" ? message.content : message.content.map((part) => {
-      if (part.type === "text") return part.text;
-      if (part.type === "image") return "[Image attached to this turn]";
-      if (part.type === "toolCall") return `[Tool call ${part.name}: ${JSON.stringify(part.arguments)}]`;
-      return "";
-    }).join("\n");
-    return `[${message.role.toUpperCase()}]\n${text}`;
-  }).join("\n\n") + "\n\nReply to the last USER message, respecting the SYSTEM instructions above.";
+  }
+  const parts = [system, omission, ...recent, trailer].filter(Boolean);
+  return { text: parts.join("\n\n").slice(0, MAX_MESSAGE_CHARS), sourceTokens };
 }
 
 function latestUserImages(context: TranscriptContext): ImageContent[] {
@@ -211,8 +249,8 @@ async function deleteResources(ids: string[], auth: AuthState, signal?: AbortSig
   }));
 }
 
-function estimatedUsage(inputText: string, outputText: string, imageCount: number) {
-  const input = Math.ceil(inputText.length / 4) + imageCount * 1600;
+function estimatedUsage(inputTokens: number, outputText: string, imageCount: number) {
+  const input = inputTokens + imageCount * 1600;
   const output = Math.ceil(outputText.length / 4);
   return { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -222,7 +260,7 @@ function streamBernard(model: Model<Api>, context: TranscriptContext, options?: 
   const stream = createAssistantMessageEventStream();
   const result: AssistantMessage = {
     role: "assistant", api: model.api, provider: model.provider, model: model.id,
-    content: [], usage: estimatedUsage("", "", 0), stopReason: "pending", timestamp: Date.now(),
+    content: [], usage: estimatedUsage(0, "", 0), stopReason: "pending", timestamp: Date.now(),
   };
   void (async () => {
     const auth: AuthState = { token: "" };
@@ -239,7 +277,8 @@ function streamBernard(model: Model<Api>, context: TranscriptContext, options?: 
       for (let index = 0; index < images.length; index++) {
         resourceIds.push(await uploadImage(images[index], index, threadId, auth, options?.signal));
       }
-      const inputText = transcriptToText(context);
+      const transcript = transcriptToText(context);
+      const inputText = transcript.text;
       const mode = thinkingMode(model.id, options?.reasoning);
       const payload = {
         message: inputText,
@@ -257,7 +296,11 @@ function streamBernard(model: Model<Api>, context: TranscriptContext, options?: 
         body: JSON.stringify(body),
       }, auth, options?.signal);
       await options?.onResponse?.(response, model);
-      if (!response.ok) throw new Error(`Bernard HTTP ${response.status}: ${await errorText(response)}`);
+      if (!response.ok) {
+        const details = await errorText(response);
+        if (response.status === 422 && details.includes("too_big")) throw new Error("context_length_exceeded: Bernard run message exceeds 50,000 characters.");
+        throw new Error(`Bernard HTTP ${response.status}: ${details}`);
+      }
       if (!response.body) throw new Error("Bernard hat keinen Stream zurückgegeben.");
       stream.push({ type: "start", partial: result });
       let buffer = "";
@@ -321,7 +364,7 @@ function streamBernard(model: Model<Api>, context: TranscriptContext, options?: 
         if (block.type === "text") stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: result });
       }
       const outputText = result.content.map((block) => block.type === "text" ? block.text : block.type === "thinking" ? block.thinking : "").join("");
-      result.usage = estimatedUsage(inputText, outputText, images.length);
+      result.usage = estimatedUsage(transcript.sourceTokens, outputText, images.length);
       result.stopReason = result.stopReason === "length" ? "length" : "stop";
       stream.push({ type: "done", reason: result.stopReason, message: result });
     } catch (error) {
