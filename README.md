@@ -2,7 +2,7 @@
 
 Unofficial [Pi](https://github.com/earendil-works/pi) provider for Swisscom's Bernard web service. **Not affiliated with or endorsed by Swisscom.** Requires authorized access to Bernard.
 
-> Bernard's `/v1/agents/run` is **not** an OpenAI-compatible API. This extension translates Pi text conversations to Bernard's run/SSE protocol.
+> Bernard's `/v1/agents/run` is **not** an OpenAI-compatible API. This extension translates Pi conversations to Bernard's resource-upload and run/SSE protocols.
 
 ## Install
 
@@ -33,9 +33,10 @@ Provide a valid Bernard JWT in `BERNARD_TOKEN` (for example in the environment l
 ## Features and limitations
 
 - Fetches available models from Bernard's authenticated `/v1/models` endpoint; `/model` refreshes the list. Includes reasoning-capable models and maps Pi thinking levels onto Bernard's `thinkingMode` (`adaptive` or `low`/`medium`/`high` where supported).
-- Streams text from `/v1/agents/run`. Replays Pi's text history inside each request as a new Bernard thread.
-- **Text only:** image inputs are rejected, not silently discarded. Pi's local coding tools cannot be invoked by Bernard; the extension disables them while Bernard is selected and restores the previous selection when you switch to another provider. Use a native coding model if you need local file access.
-- Reasoning effort can be selected but Bernard may not expose the reasoning trace through this run endpoint. Token usage, model pricing, and true maximum output limits are not provided by the Bernard catalog; Pi displays zero cost and an estimated 8192-token output limit.
+- Streams text and available reasoning events from `/v1/agents/run`. Replays Pi's text history inside each request as a new Bernard thread.
+- Supports up to five PNG, JPEG, or WebP images on the latest user turn for vision-capable catalog models. Images use Bernard's `/v1/resources` presigned-upload flow and temporary resources are deleted after the response. Historical images are represented by text placeholders rather than uploaded again on every turn.
+- Pi's local coding tools cannot be invoked by Bernard. Tool declarations are omitted from the Bernard transcript, but the extension does not globally disable tools, so switching providers keeps the user's tool selection intact. Use a native coding model when local file access is required.
+- Reasoning effort can be selected with `/thinking`; `adaptive` and explicit `low`/`medium`/`high` modes are mapped from the live catalog. Bernard does not publish pricing, actual token usage, or output limits. The extension reports zero cost, estimates token counts (so Pi auto-compaction can trigger), and uses an estimated 8192-token output limit.
 - The browser automation path is macOS/Safari-only and needs explicit Safari/macOS permission. Token expiry is checked locally and unauthorized requests are retried once after reauthentication.
 
 ## Security
