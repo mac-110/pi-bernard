@@ -1,0 +1,14 @@
+{
+  "name": "pi-bernard",
+  "version": "0.1.0",
+  "description": "Unofficial Bernard (Swisscom) provider extension for Pi",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi", "bernard"],
+  "pi": {
+    "extensions": ["./extensions/bernard/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

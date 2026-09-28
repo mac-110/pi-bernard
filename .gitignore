@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.env
+.env.*
+auth.json
+bernard-session.json
+*.tmp
+.DS_Store
