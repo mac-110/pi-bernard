@@ -8,7 +8,8 @@ import {
   type ThinkingLevelMap,
   type TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderModelConfig, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { bernardToken } from "./session.js";
 
@@ -33,6 +34,18 @@ interface BernardModelItem {
 
 interface AuthState { token: string }
 interface BernardResource { _id: string; mimeType: string; status?: string; failureCode?: string }
+interface StoredThreadState { threadId?: string; estimatedTokens?: number; systemSignature?: string }
+interface ThreadLease {
+  threadId: string;
+  bootstrap: boolean;
+  estimatedTokens: number;
+  systemSignature: string;
+  temporary: boolean;
+}
+interface ThreadCoordinator {
+  acquire(systemSignature: string): ThreadLease;
+  commit(lease: ThreadLease, estimatedTokens: number): void;
+}
 
 const fallback: ProviderModelConfig[] = [{
   id: "claude-sonnet-4-6",
@@ -146,13 +159,27 @@ function transcriptToText(context: TranscriptContext): { text: string; sourceTok
   return { text: parts.join("\n\n").slice(0, MAX_MESSAGE_CHARS), sourceTokens };
 }
 
-function latestUserImages(context: TranscriptContext): ImageContent[] {
+function latestUserMessage(context: TranscriptContext) {
   for (let index = context.messages.length - 1; index >= 0; index--) {
-    const message = context.messages[index];
-    if (message.role !== "user") continue;
-    return Array.isArray(message.content) ? message.content.filter((part): part is ImageContent => part.type === "image") : [];
+    if (context.messages[index].role === "user") return context.messages[index];
   }
-  return [];
+}
+
+function latestUserImages(context: TranscriptContext): ImageContent[] {
+  const message = latestUserMessage(context);
+  return message && Array.isArray(message.content)
+    ? message.content.filter((part): part is ImageContent => part.type === "image")
+    : [];
+}
+
+function latestUserText(context: TranscriptContext): string {
+  const message = latestUserMessage(context);
+  return message ? renderMessage(message) : "[USER]\nContinue.";
+}
+
+function currentSystemSignature(context: TranscriptContext): string {
+  const system = context.messages.filter((message) => message.role === "system").map(renderMessage).join("\n\n");
+  return createHash("sha256").update(system).digest("hex");
 }
 
 function authHeaders(token: string, json = false): Record<string, string> {
@@ -256,7 +283,12 @@ function estimatedUsage(inputTokens: number, outputText: string, imageCount: num
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 }
 
-function streamBernard(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
+function streamBernard(
+  model: Model<Api>,
+  context: TranscriptContext,
+  options: SimpleStreamOptions | undefined,
+  threads: ThreadCoordinator,
+) {
   const stream = createAssistantMessageEventStream();
   const result: AssistantMessage = {
     role: "assistant", api: model.api, provider: model.provider, model: model.id,
@@ -273,16 +305,18 @@ function streamBernard(model: Model<Api>, context: TranscriptContext, options?: 
       const images = latestUserImages(context);
       if (images.length > MAX_IMAGES) throw new Error(`Bernard unterstützt höchstens ${MAX_IMAGES} Bilder pro Nachricht.`);
       if (images.length && !model.input.includes("image")) throw new Error(`${model.name} unterstützt laut Bernard-Katalog keine Bilder.`);
-      const threadId = crypto.randomUUID();
+      const lease = threads.acquire(currentSystemSignature(context));
       for (let index = 0; index < images.length; index++) {
-        resourceIds.push(await uploadImage(images[index], index, threadId, auth, options?.signal));
+        resourceIds.push(await uploadImage(images[index], index, lease.threadId, auth, options?.signal));
       }
-      const transcript = transcriptToText(context);
-      const inputText = transcript.text;
+      const transcript = lease.bootstrap ? transcriptToText(context) : undefined;
+      const inputText = transcript?.text ?? latestUserText(context);
+      const requestTokens = transcript?.sourceTokens ?? Math.ceil(inputText.length / 4);
+      const contextInputTokens = (lease.bootstrap ? 0 : lease.estimatedTokens) + requestTokens + images.length * 1600;
       const mode = thinkingMode(model.id, options?.reasoning);
       const payload = {
         message: inputText,
-        threadId,
+        threadId: lease.threadId,
         userMessageId: crypto.randomUUID(),
         modelId: model.id,
         webSearchMode: false,
@@ -364,7 +398,8 @@ function streamBernard(model: Model<Api>, context: TranscriptContext, options?: 
         if (block.type === "text") stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: result });
       }
       const outputText = result.content.map((block) => block.type === "text" ? block.text : block.type === "thinking" ? block.thinking : "").join("");
-      result.usage = estimatedUsage(transcript.sourceTokens, outputText, images.length);
+      result.usage = estimatedUsage(contextInputTokens, outputText, 0);
+      threads.commit(lease, result.usage.totalTokens);
       result.stopReason = result.stopReason === "length" ? "length" : "stop";
       stream.push({ type: "done", reason: result.stopReason, message: result });
     } catch (error) {
@@ -389,6 +424,56 @@ async function loadModels(signal?: AbortSignal): Promise<ProviderModelConfig[]> 
 }
 
 export default async function (pi: ExtensionAPI) {
+  let activeThread: (StoredThreadState & { synced: boolean }) | undefined;
+  let temporaryThread: (StoredThreadState & { synced: boolean }) | undefined;
+  let compacting = false;
+
+  const resetThread = (persist: boolean) => {
+    activeThread = undefined;
+    temporaryThread = undefined;
+    if (persist) pi.appendEntry<StoredThreadState>("bernard-thread", {});
+  };
+  const restoreThread = (branch: SessionEntry[]) => {
+    activeThread = undefined;
+    for (const entry of branch) {
+      if (entry.type !== "custom" || entry.customType !== "bernard-thread") continue;
+      const data = entry.data as StoredThreadState | undefined;
+      activeThread = data?.threadId
+        ? { threadId: data.threadId, estimatedTokens: data.estimatedTokens ?? 0, systemSignature: data.systemSignature, synced: true }
+        : undefined;
+    }
+  };
+  const threads: ThreadCoordinator = {
+    acquire(systemSignature) {
+      if (compacting) {
+        if (!temporaryThread || temporaryThread.systemSignature !== systemSignature) {
+          temporaryThread = { threadId: crypto.randomUUID(), estimatedTokens: 0, systemSignature, synced: false };
+        }
+        return { threadId: temporaryThread.threadId!, bootstrap: !temporaryThread.synced,
+          estimatedTokens: temporaryThread.estimatedTokens ?? 0, systemSignature, temporary: true };
+      }
+      if (!activeThread || activeThread.systemSignature !== systemSignature) {
+        activeThread = { threadId: crypto.randomUUID(), estimatedTokens: 0, systemSignature, synced: false };
+      }
+      return { threadId: activeThread.threadId!, bootstrap: !activeThread.synced,
+        estimatedTokens: activeThread.estimatedTokens ?? 0, systemSignature, temporary: false };
+    },
+    commit(lease, estimatedTokens) {
+      const target = lease.temporary ? temporaryThread : activeThread;
+      if (!target || target.threadId !== lease.threadId) return;
+      target.synced = true;
+      target.estimatedTokens = estimatedTokens;
+      target.systemSignature = lease.systemSignature;
+      if (!lease.temporary) {
+        pi.appendEntry<StoredThreadState>("bernard-thread", {
+          threadId: target.threadId,
+          estimatedTokens,
+          systemSignature: target.systemSignature,
+        });
+      }
+    },
+  };
+
   let initialModels = fallback;
   try { initialModels = await loadModels(); } catch { /* Offline or signed out: retain fallback. */ }
   pi.registerProvider("bernard", {
@@ -400,7 +485,7 @@ export default async function (pi: ExtensionAPI) {
       if (!context.allowNetwork) return initialModels;
       return loadModels(context.signal);
     },
-    streamSimple: streamBernard,
+    streamSimple: (model, context, options) => streamBernard(model, context, options, threads),
   });
   pi.registerCommand("bernard-login", {
     description: "Bernard-Sitzung aus Safari übernehmen (bei Bedarf Browser-Login öffnen)",
@@ -412,6 +497,27 @@ export default async function (pi: ExtensionAPI) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
     },
+  });
+  pi.on("session_start", (event, ctx) => {
+    if (event.reason === "fork") resetThread(true);
+    else if (event.reason === "new") resetThread(false);
+    else restoreThread(ctx.sessionManager.getBranch());
+  });
+  pi.on("session_tree", () => resetThread(true));
+  pi.on("model_select", (event) => {
+    if (event.model.provider === "bernard" && event.previousModel && event.previousModel.provider !== "bernard") resetThread(true);
+  });
+  pi.on("session_before_compact", () => {
+    compacting = true;
+    temporaryThread = undefined;
+  });
+  pi.on("session_compact", () => {
+    compacting = false;
+    resetThread(true);
+  });
+  pi.on("session_compact_failed", () => {
+    compacting = false;
+    temporaryThread = undefined;
   });
   // Do not mutate Pi's active tools. Bernard receives no tool declarations and cannot emit Pi tool calls.
 }
