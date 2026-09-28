@@ -1,17 +1,36 @@
 import {
   createAssistantMessageEventStream,
+  getCurrentSystemMessage,
+  getCurrentTools,
+  getInitialSystemMessage,
+  getSystemMessageText,
+  renderSystemMessageUpdate,
+  toToolDeclaration,
   type Api,
   type AssistantMessage,
   type ImageContent,
+  type JsonObject,
   type Model,
   type SimpleStreamOptions,
   type ThinkingLevelMap,
+  type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ProviderModelConfig, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { bernardToken } from "./session.js";
+import {
+  neutralizeTags,
+  renderToolCall,
+  renderToolInstructions,
+  renderToolResult,
+  renderToolsUpdate,
+  ToolCallParser,
+  toolTags,
+  type ToolSegment,
+  type ToolTags,
+} from "./tools.js";
 
 const BASE = "https://api.bernard.swisscom.com/v1";
 const RUN_URL = `${BASE}/agents/run`;
@@ -34,17 +53,19 @@ interface BernardModelItem {
 
 interface AuthState { token: string }
 interface BernardResource { _id: string; mimeType: string; status?: string; failureCode?: string }
-interface StoredThreadState { threadId?: string; estimatedTokens?: number; systemSignature?: string }
+// `messageId` is Bernard's id of the last committed reply; later runs attach to it as parent.
+interface StoredThreadState { threadId?: string; estimatedTokens?: number; systemSignature?: string; messageId?: string }
 interface ThreadLease {
   threadId: string;
   bootstrap: boolean;
   estimatedTokens: number;
   systemSignature: string;
   temporary: boolean;
+  parentMessageId?: string;
 }
 interface ThreadCoordinator {
   acquire(systemSignature: string): ThreadLease;
-  commit(lease: ThreadLease, estimatedTokens: number): void;
+  commit(lease: ThreadLease, estimatedTokens: number, messageId?: string): void;
 }
 
 const fallback: ProviderModelConfig[] = [{
@@ -101,85 +122,167 @@ function thinkingMode(modelId: string, level?: string): string | undefined {
   return supported.filter((mode) => mode !== "off").at(-1);
 }
 
-function clipMiddle(value: string, limit: number): string {
-  if (value.length <= limit) return value;
-  const marker = "\n[… content omitted to fit Bernard's 50,000-character transport limit …]\n";
-  const available = Math.max(0, limit - marker.length);
-  const start = Math.ceil(available * 0.6);
-  return value.slice(0, start) + marker + value.slice(value.length - (available - start));
+type TranscriptMessage = TranscriptContext["messages"][number];
+
+interface RenderContext {
+  tags: ToolTags;
+  /** Notes for images in the messages sent with this run; older images are only mentioned. */
+  imageNotes: Map<ImageContent, string>;
+  /** 1-based position of each tool call within its assistant message. */
+  callNumbers: Map<string, number>;
 }
 
-function renderMessage(message: TranscriptContext["messages"][number]): string {
+/** Slice without splitting a UTF-16 surrogate pair. */
+function safeSlice(value: string, start: number, end = value.length): string {
+  const low = (index: number) => index > 0 && index < value.length && /[\uDC00-\uDFFF]/.test(value[index]);
+  if (low(start)) start++;
+  if (low(end)) end--;
+  return value.slice(start, Math.max(start, end));
+}
+
+function clipMiddle(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const marker = `\n[… ${value.length - limit} characters omitted to fit Bernard's 50,000-character message limit; request a smaller range if you need them …]\n`;
+  const available = Math.max(0, limit - marker.length);
+  const start = Math.ceil(available * 0.6);
+  return safeSlice(value, 0, start) + marker + safeSlice(value, value.length - (available - start));
+}
+
+function joinedLength(parts: string[]): number {
+  return parts.reduce((total, part) => total + part.length, 0) + Math.max(0, parts.length - 1) * 2;
+}
+
+/** Clip parts so they fit `budget` together; short parts stay whole and long ones share the rest. */
+function fitParts(parts: string[], budget: number): string[] {
+  let remaining = Math.max(0, budget - Math.max(0, parts.length - 1) * 2);
+  const limits: number[] = [];
+  const order = parts.map((_, index) => index).sort((left, right) => parts[left].length - parts[right].length);
+  order.forEach((index, position) => {
+    limits[index] = Math.min(parts[index].length, Math.floor(remaining / (order.length - position)));
+    remaining -= limits[index];
+  });
+  return parts.map((part, index) => clipMiddle(part, limits[index]));
+}
+
+function imageNote(image: ImageContent, render: RenderContext): string {
+  return render.imageNotes.get(image) ?? "[Image from an earlier turn; not attached again]";
+}
+
+function renderMessage(message: TranscriptMessage, render: RenderContext): string {
   if (message.role === "system") {
-    const text = typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join("\n");
-    const sections = Object.entries(message.sections ?? {})
-      .filter(([name, value]) => name !== "tools" && Boolean(value))
-      .map(([, value]) => value)
-      .join("\n");
-    return `[SYSTEM]\n${text}\n${sections}`;
+    const update = renderSystemMessageUpdate(message);
+    return update ? `[PI INSTRUCTIONS UPDATE]\n${update}` : "";
   }
   if (message.role === "toolResult") {
-    return `[TOOL RESULT: ${message.toolName}]\n${message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")}`;
+    const body = message.content.map((part) => part.type === "text" ? part.text : imageNote(part, render)).join("\n");
+    const call = render.callNumbers.get(message.toolCallId);
+    return renderToolResult({ name: message.toolName, call, isError: message.isError }, body, render.tags);
   }
   const text = typeof message.content === "string" ? message.content : message.content.map((part) => {
     if (part.type === "text") return part.text;
-    if (part.type === "image") return "[Image attached to this turn]";
-    if (part.type === "toolCall") return `[Tool call ${part.name}: ${JSON.stringify(part.arguments)}]`;
+    if (part.type === "image") return imageNote(part, render);
+    if (part.type === "toolCall") return renderToolCall(part.name, part.arguments, render.tags);
     return "";
-  }).join("\n");
-  return `[${message.role.toUpperCase()}]\n${text}`;
+  }).filter(Boolean).join("\n");
+  return `[${message.role.toUpperCase()}]\n${message.role === "user" ? neutralizeTags(text, render.tags) : text}`;
 }
 
-function transcriptToText(context: TranscriptContext): { text: string; sourceTokens: number } {
-  const rendered = context.messages.map(renderMessage);
-  const trailer = "Reply to the last USER message, respecting the SYSTEM instructions above.";
-  const full = rendered.join("\n\n") + `\n\n${trailer}`;
+/** Index of the first message Bernard has not seen: everything after its latest reply. */
+function pendingStart(messages: TranscriptMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role === "assistant") return index + 1;
+  }
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role === "user") return index;
+  }
+  return messages.length;
+}
+
+function callNumbers(messages: TranscriptMessage[]): Map<string, number> {
+  const numbers = new Map<string, number>();
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    message.content.filter((part): part is ToolCall => part.type === "toolCall").forEach((part, index) => numbers.set(part.id, index + 1));
+  }
+  return numbers;
+}
+
+/** Images in the unsent messages, in order. Tool-result images are marked so they never block the tool loop. */
+function pendingImages(messages: TranscriptMessage[]): { image: ImageContent; fromTool: boolean }[] {
+  return messages.flatMap((message) => {
+    if ((message.role !== "user" && message.role !== "toolResult") || typeof message.content === "string") return [];
+    return message.content
+      .filter((part): part is ImageContent => part.type === "image")
+      .map((image) => ({ image, fromTool: message.role === "toolResult" }));
+  });
+}
+
+const BOOTSTRAP_INTRO = "I'm using you through Pi, an open-source coding agent that I run on my own computer via the pi-bernard extension. Pi relays this conversation: it passes on my messages, the operating instructions I configured for it, and the results of the tools it runs on my computer when you call them. Please follow the Pi instructions and tool protocol below for the rest of this conversation.";
+
+const RESULTS_NOTE = "[PI] Results of the tool calls in your previous reply. Pi ignored anything written after your last tool call.";
+
+/** The first run of a thread synchronizes the prompt, the tool protocol, and as much history as fits. */
+function bootstrapText(context: TranscriptContext, start: number, render: RenderContext, notes: string[]): { text: string; sourceTokens: number } {
+  const system = getCurrentSystemMessage(context.messages);
+  const prompt = system ? getSystemMessageText(system) : "";
+  const tools = getCurrentTools(context.messages);
+  const toolBlock = tools.length ? renderToolInstructions(tools, render.tags) : "";
+  const conversation = (messages: TranscriptMessage[]) => messages
+    .filter((message) => message.role !== "system")
+    .map((message) => renderMessage(message, render))
+    .filter(Boolean);
+  const history = conversation(context.messages.slice(0, start));
+  const pending = conversation(context.messages.slice(start));
+  const trailer = [...notes, "Please reply to my latest message, or continue the task after the latest tool results."].join("\n");
+  // Bernard's models treat a fake "[SYSTEM]" block in a user message as prompt injection and then
+  // refuse Pi's tools, so the message says truthfully that the user's own Pi relays it.
+  const head = (systemText: string) => [
+    BOOTSTRAP_INTRO,
+    systemText ? `<pi_instructions>\n${systemText}\n</pi_instructions>` : "",
+    toolBlock,
+    "The conversation so far follows. [USER] marks my messages and [ASSISTANT] marks earlier replies.",
+  ].filter(Boolean);
+  const full = [...head(prompt), ...history, ...pending, trailer].join("\n\n");
   const sourceTokens = Math.ceil(full.length / 4);
   if (full.length <= MAX_MESSAGE_CHARS) return { text: full, sourceTokens };
 
-  const systemIndex = context.messages.findIndex((message) => message.role === "system");
-  const system = systemIndex >= 0 ? clipMiddle(rendered[systemIndex], MAX_SYSTEM_CHARS) : "";
+  // Keep the prompt and tool declarations whole, fit the newest messages, then add recent history.
   const omission = "[Earlier conversation omitted because Bernard limits each run message to 50,000 characters.]";
-  const fixedLength = system.length + trailer.length + omission.length + 8;
-  let remaining = Math.max(0, MAX_MESSAGE_CHARS - fixedLength);
+  const clippedHead = head(clipMiddle(prompt, MAX_SYSTEM_CHARS));
+  let remaining = MAX_MESSAGE_CHARS - joinedLength([...clippedHead, omission, trailer]) - 4;
+  if (remaining <= 0) throw new Error("Pi-Systemprompt und Tooldefinitionen überschreiten Bernards 50.000-Zeichen-Limit pro Nachricht.");
+  const fitted = fitParts(pending, Math.min(joinedLength(pending), history.length ? Math.floor(remaining * 0.6) : remaining));
+  remaining -= joinedLength(fitted);
   const recent: string[] = [];
-  for (let index = rendered.length - 1; index >= 0 && remaining > 0; index--) {
-    if (index === systemIndex) continue;
-    const separator = recent.length ? 2 : 0;
-    if (rendered[index].length + separator <= remaining) {
-      recent.unshift(rendered[index]);
-      remaining -= rendered[index].length + separator;
-    } else {
-      // Always preserve both the beginning and end of the newest oversized turn.
-      if (!recent.length) recent.unshift(clipMiddle(rendered[index], remaining));
-      break;
-    }
+  for (let index = history.length - 1; index >= 0 && history[index].length + 2 <= remaining; index--) {
+    recent.unshift(history[index]);
+    remaining -= history[index].length + 2;
   }
-  const parts = [system, omission, ...recent, trailer].filter(Boolean);
-  return { text: parts.join("\n\n").slice(0, MAX_MESSAGE_CHARS), sourceTokens };
+  const parts = [...clippedHead, ...(recent.length < history.length ? [omission] : []), ...recent, ...fitted, trailer];
+  return { text: safeSlice(parts.join("\n\n"), 0, MAX_MESSAGE_CHARS), sourceTokens };
 }
 
-function latestUserMessage(context: TranscriptContext) {
-  for (let index = context.messages.length - 1; index >= 0; index--) {
-    if (context.messages[index].role === "user") return context.messages[index];
+/** Later runs send only what Bernard has not seen: tool results, new user turns, and prompt or tool changes. */
+function deltaText(context: TranscriptContext, start: number, render: RenderContext, notes: string[]): string {
+  const pending = context.messages.slice(start);
+  const updates = pending.filter((message) => message.role === "system").map((message) => renderMessage(message, render)).filter(Boolean);
+  if (pending.some((message) => message.role === "system" && (message.toolsAdded?.length || message.toolsRemoved?.length))) {
+    updates.push(renderToolsUpdate(getCurrentTools(context.messages), render.tags));
   }
+  // The model may have kept writing after its calls; that text was never shown and is not an answer.
+  if (pending.some((message) => message.role === "toolResult")) updates.push(RESULTS_NOTE);
+  const body = pending.filter((message) => message.role !== "system").map((message) => renderMessage(message, render)).filter(Boolean);
+  if (!body.length && !updates.length) body.push("[USER]\nContinue.");
+  const budget = MAX_MESSAGE_CHARS - joinedLength([...updates, ...notes]) - 4;
+  if (budget <= 0) throw new Error("Pi-Systemprompt und Tooldefinitionen überschreiten Bernards 50.000-Zeichen-Limit pro Nachricht.");
+  return safeSlice([...updates, ...fitParts(body, budget), ...notes].join("\n\n"), 0, MAX_MESSAGE_CHARS);
 }
 
-function latestUserImages(context: TranscriptContext): ImageContent[] {
-  const message = latestUserMessage(context);
-  return message && Array.isArray(message.content)
-    ? message.content.filter((part): part is ImageContent => part.type === "image")
-    : [];
-}
-
-function latestUserText(context: TranscriptContext): string {
-  const message = latestUserMessage(context);
-  return message ? renderMessage(message) : "[USER]\nContinue.";
-}
-
+/** Only the leading prompt identifies a thread; later prompt and tool changes are sent in place. */
 function currentSystemSignature(context: TranscriptContext): string {
-  const system = context.messages.filter((message) => message.role === "system").map(renderMessage).join("\n\n");
-  return createHash("sha256").update(system).digest("hex");
+  const system = getInitialSystemMessage(context.messages);
+  const state = system ? { prompt: getSystemMessageText(system), tools: (system.toolsAdded ?? []).map(toToolDeclaration) } : {};
+  return createHash("sha256").update(JSON.stringify(state)).digest("hex");
 }
 
 function authHeaders(token: string, json = false): Record<string, string> {
@@ -300,26 +403,106 @@ function streamBernard(
     let ended = false;
     let textIndex: number | undefined;
     let thinkingIndex: number | undefined;
+    const closeText = () => {
+      if (textIndex === undefined) return;
+      const block = result.content[textIndex];
+      if (block.type === "text") stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: result });
+      textIndex = undefined;
+    };
+    const closeThinking = () => {
+      if (thinkingIndex === undefined) return;
+      const block = result.content[thinkingIndex];
+      if (block.type === "thinking") stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: block.thinking, partial: result });
+      thinkingIndex = undefined;
+    };
+    const appendText = (delta: string) => {
+      closeThinking();
+      if (textIndex === undefined) {
+        textIndex = result.content.length;
+        result.content.push({ type: "text", text: "" });
+        stream.push({ type: "text_start", contentIndex: textIndex, partial: result });
+      }
+      const block = result.content[textIndex];
+      if (block.type === "text") block.text += delta;
+      stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: result });
+    };
+    const appendThinking = (delta: string) => {
+      closeText();
+      if (thinkingIndex === undefined) {
+        thinkingIndex = result.content.length;
+        result.content.push({ type: "thinking", thinking: "" });
+        stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: result });
+      }
+      const block = result.content[thinkingIndex];
+      if (block.type === "thinking") block.thinking += delta;
+      if (delta) stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta, partial: result });
+    };
+    // A parsed call is complete, so its start, arguments, and end are emitted together.
+    const addToolCall = (name: string, args: JsonObject) => {
+      closeText();
+      closeThinking();
+      const contentIndex = result.content.length;
+      const call: ToolCall = { type: "toolCall", id: `call_${crypto.randomUUID().replaceAll("-", "")}`, name, arguments: {} };
+      result.content.push(call);
+      stream.push({ type: "toolcall_start", contentIndex, partial: result });
+      call.arguments = args;
+      stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(args), partial: result });
+      stream.push({ type: "toolcall_end", contentIndex, toolCall: call, partial: result });
+    };
+    const apply = (segments: ToolSegment[]) => {
+      for (const segment of segments) {
+        if (segment.type === "text") appendText(segment.text);
+        else addToolCall(segment.name, segment.arguments);
+      }
+    };
     try {
       auth.token = await bernardToken({ signal: options?.signal, supplied: options?.apiKey });
-      const images = latestUserImages(context);
-      if (images.length > MAX_IMAGES) throw new Error(`Bernard unterstützt höchstens ${MAX_IMAGES} Bilder pro Nachricht.`);
-      if (images.length && !model.input.includes("image")) throw new Error(`${model.name} unterstützt laut Bernard-Katalog keine Bilder.`);
-      const lease = threads.acquire(currentSystemSignature(context));
-      for (let index = 0; index < images.length; index++) {
-        resourceIds.push(await uploadImage(images[index], index, lease.threadId, auth, options?.signal));
+      // Like Pi's built-in providers, skip failed replies. Runs attach to the last successful reply,
+      // so the messages after it (including the failed turn's user message) are sent again.
+      const replay = { ...context, messages: context.messages.filter((message) =>
+        message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted")) };
+      const start = pendingStart(replay.messages);
+      const images = pendingImages(replay.messages.slice(start));
+      const userImages = images.filter((image) => !image.fromTool).length;
+      const vision = model.input.includes("image");
+      if (userImages > MAX_IMAGES) throw new Error(`Bernard unterstützt höchstens ${MAX_IMAGES} Bilder pro Nachricht.`);
+      if (userImages && !vision) throw new Error(`${model.name} unterstützt laut Bernard-Katalog keine Bilder.`);
+      const lease = threads.acquire(currentSystemSignature(replay));
+      const tags = toolTags(lease.threadId);
+      const tools = getCurrentTools(replay.messages);
+      const toolsEnabled = tools.length > 0 && options?.toolChoice !== "none";
+      const notes = tools.length && !toolsEnabled ? ["[PI] Do not call any Pi tools in this reply."] : [];
+
+      const imageNotes = new Map<ImageContent, string>();
+      const uploads: ImageContent[] = [];
+      for (const { image } of images) {
+        if (!vision) imageNotes.set(image, `[Image omitted: ${model.name} cannot read images]`);
+        else if (uploads.length >= MAX_IMAGES) imageNotes.set(image, `[Image omitted: Bernard accepts at most ${MAX_IMAGES} images per message]`);
+        else {
+          uploads.push(image);
+          imageNotes.set(image, `[Image ${uploads.length} attached to this message]`);
+        }
       }
-      const transcript = lease.bootstrap ? transcriptToText(context) : undefined;
-      const inputText = transcript?.text ?? latestUserText(context);
+      for (let index = 0; index < uploads.length; index++) {
+        resourceIds.push(await uploadImage(uploads[index], index, lease.threadId, auth, options?.signal));
+      }
+      const render: RenderContext = { tags, imageNotes, callNumbers: callNumbers(replay.messages) };
+      const transcript = lease.bootstrap ? bootstrapText(replay, start, render, notes) : undefined;
+      const inputText = transcript?.text ?? deltaText(replay, start, render, notes);
       const requestTokens = transcript?.sourceTokens ?? Math.ceil(inputText.length / 4);
-      const contextInputTokens = (lease.bootstrap ? 0 : lease.estimatedTokens) + requestTokens + images.length * 1600;
+      const contextInputTokens = (lease.bootstrap ? 0 : lease.estimatedTokens) + requestTokens + uploads.length * 1600;
       const mode = thinkingMode(model.id, options?.reasoning);
       const payload = {
         message: inputText,
         threadId: lease.threadId,
         userMessageId: crypto.randomUUID(),
         modelId: model.id,
+        // Attach to Bernard's last reply explicitly, like Bernard's web client does when editing:
+        // without a parent, a tool result sent right after a reply was stored as that reply's sibling.
+        ...(!lease.bootstrap && lease.parentMessageId ? { parentMessageId: lease.parentMessageId } : {}),
         webSearchMode: false,
+        // Pi executes code locally; Bernard's cloud sandbox would compete with Pi's tools.
+        codeMode: false,
         ...(resourceIds.length ? { attachmentIds: resourceIds } : {}),
         ...(mode ? { thinkingMode: mode } : {}),
       };
@@ -329,7 +512,7 @@ function streamBernard(
         headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...options?.headers },
         body: JSON.stringify(body),
       }, auth, options?.signal);
-      await options?.onResponse?.(response, model);
+      await options?.onResponse?.({ status: response.status, headers: Object.fromEntries(response.headers) }, model);
       if (!response.ok) {
         const details = await errorText(response);
         if (response.status === 422 && details.includes("too_big")) throw new Error("context_length_exceeded: Bernard run message exceeds 50,000 characters.");
@@ -337,6 +520,8 @@ function streamBernard(
       }
       if (!response.body) throw new Error("Bernard hat keinen Stream zurückgegeben.");
       stream.push({ type: "start", partial: result });
+      const parser = toolsEnabled ? new ToolCallParser(tags) : undefined;
+      let messageId: string | undefined;
       let buffer = "";
       const decoder = new TextDecoder();
       const handle = (raw: string) => {
@@ -344,63 +529,51 @@ function streamBernard(
         if (!lines.length) return;
         const data = lines.map((line) => line.slice(5).trimStart()).join("\n");
         if (data === "[DONE]") return;
-        const event = JSON.parse(data) as { type?: string; delta?: string; error?: string | { message?: string }; finishReason?: string };
+        const event = JSON.parse(data) as {
+          type?: string; delta?: string; error?: string | { message?: string }; finishReason?: string; messageMetadata?: { ricoId?: string };
+        };
+        if (event.type === "message-metadata" && event.messageMetadata?.ricoId) messageId = event.messageMetadata.ricoId;
         if (event.type === "error") throw new Error(typeof event.error === "string" ? event.error : event.error?.message ?? "Bernard stream error");
-        if (event.type === "reasoning-start" && thinkingIndex === undefined) {
-          thinkingIndex = result.content.length;
-          result.content.push({ type: "thinking", thinking: "" });
-          stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: result });
-        }
-        if (event.type === "reasoning-delta" && event.delta) {
-          if (thinkingIndex === undefined) {
-            thinkingIndex = result.content.length;
-            result.content.push({ type: "thinking", thinking: "" });
-            stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: result });
-          }
-          const block = result.content[thinkingIndex];
-          if (block.type === "thinking") block.thinking += event.delta;
-          stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta: event.delta, partial: result });
-        }
-        if (event.type === "reasoning-end" && thinkingIndex !== undefined) {
-          const block = result.content[thinkingIndex];
-          if (block.type === "thinking") stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: block.thinking, partial: result });
-        }
-        if (event.type === "text-delta" && event.delta) {
-          if (textIndex === undefined) {
-            textIndex = result.content.length;
-            result.content.push({ type: "text", text: "" });
-            stream.push({ type: "text_start", contentIndex: textIndex, partial: result });
-          }
-          const block = result.content[textIndex];
-          if (block.type === "text") block.text += event.delta;
-          stream.push({ type: "text_delta", contentIndex: textIndex, delta: event.delta, partial: result });
-        }
+        if (event.type === "reasoning-start") appendThinking("");
+        if (event.type === "reasoning-delta" && event.delta) appendThinking(event.delta);
+        if (event.type === "reasoning-end") closeThinking();
+        if (event.type === "text-delta" && event.delta) apply(parser ? parser.push(event.delta) : [{ type: "text", text: event.delta }]);
         if (event.type === "finish") {
           if (event.finishReason === "error") throw new Error("Bernard hat die Antwort mit einem Fehler beendet.");
           if (event.finishReason === "length") result.stopReason = "length";
           ended = true;
         }
       };
-      for await (const chunk of response.body) {
+      read: for await (const chunk of response.body) {
         buffer += decoder.decode(chunk, { stream: true });
         let position: number;
         while ((position = buffer.search(/\r?\n\r?\n/)) !== -1) {
           const separator = buffer.slice(position).match(/^\r?\n\r?\n/)![0];
           handle(buffer.slice(0, position));
           buffer = buffer.slice(position + separator.length);
+          // The model began inventing tool results: keep its calls and stop the generation, so
+          // Bernard's thread does not continue with a made-up answer.
+          if (parser?.fabricated) break read;
         }
       }
-      buffer += decoder.decode();
-      if (buffer.trim()) handle(buffer);
-      if (!ended) throw new Error("Bernard-Stream ohne finish-Event beendet.");
-      if (textIndex !== undefined) {
-        const block = result.content[textIndex];
-        if (block.type === "text") stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: result });
+      if (parser?.fabricated) {
+        ended = true;
+        try { await authenticatedFetch(`${BASE}/threads/${lease.threadId}/stop`, { method: "POST" }, auth, options?.signal); }
+        catch { /* Best effort: the calls are already complete. */ }
+      } else {
+        buffer += decoder.decode();
+        if (buffer.trim()) handle(buffer);
       }
-      const outputText = result.content.map((block) => block.type === "text" ? block.text : block.type === "thinking" ? block.thinking : "").join("");
+      if (!ended) throw new Error("Bernard-Stream ohne finish-Event beendet.");
+      if (parser) apply(parser.finish());
+      closeText();
+      closeThinking();
+      const outputText = result.content.map((block) => block.type === "text" ? block.text
+        : block.type === "thinking" ? block.thinking : JSON.stringify(block.arguments)).join("");
       result.usage = estimatedUsage(contextInputTokens, outputText, 0);
-      threads.commit(lease, result.usage.totalTokens);
-      result.stopReason = result.stopReason === "length" ? "length" : "stop";
+      threads.commit(lease, result.usage.totalTokens, messageId);
+      const called = result.content.some((block) => block.type === "toolCall");
+      result.stopReason = result.stopReason === "length" ? "length" : called ? "toolUse" : "stop";
       stream.push({ type: "done", reason: result.stopReason, message: result });
     } catch (error) {
       result.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -439,7 +612,7 @@ export default async function (pi: ExtensionAPI) {
       if (entry.type !== "custom" || entry.customType !== "bernard-thread") continue;
       const data = entry.data as StoredThreadState | undefined;
       activeThread = data?.threadId
-        ? { threadId: data.threadId, estimatedTokens: data.estimatedTokens ?? 0, systemSignature: data.systemSignature, synced: true }
+        ? { threadId: data.threadId, estimatedTokens: data.estimatedTokens ?? 0, systemSignature: data.systemSignature, messageId: data.messageId, synced: true }
         : undefined;
     }
   };
@@ -450,25 +623,27 @@ export default async function (pi: ExtensionAPI) {
           temporaryThread = { threadId: crypto.randomUUID(), estimatedTokens: 0, systemSignature, synced: false };
         }
         return { threadId: temporaryThread.threadId!, bootstrap: !temporaryThread.synced,
-          estimatedTokens: temporaryThread.estimatedTokens ?? 0, systemSignature, temporary: true };
+          estimatedTokens: temporaryThread.estimatedTokens ?? 0, systemSignature, temporary: true, parentMessageId: temporaryThread.messageId };
       }
       if (!activeThread || activeThread.systemSignature !== systemSignature) {
         activeThread = { threadId: crypto.randomUUID(), estimatedTokens: 0, systemSignature, synced: false };
       }
       return { threadId: activeThread.threadId!, bootstrap: !activeThread.synced,
-        estimatedTokens: activeThread.estimatedTokens ?? 0, systemSignature, temporary: false };
+        estimatedTokens: activeThread.estimatedTokens ?? 0, systemSignature, temporary: false, parentMessageId: activeThread.messageId };
     },
-    commit(lease, estimatedTokens) {
+    commit(lease, estimatedTokens, messageId) {
       const target = lease.temporary ? temporaryThread : activeThread;
       if (!target || target.threadId !== lease.threadId) return;
       target.synced = true;
       target.estimatedTokens = estimatedTokens;
       target.systemSignature = lease.systemSignature;
+      target.messageId = messageId;
       if (!lease.temporary) {
         pi.appendEntry<StoredThreadState>("bernard-thread", {
           threadId: target.threadId,
           estimatedTokens,
           systemSignature: target.systemSignature,
+          messageId,
         });
       }
     },
@@ -519,5 +694,5 @@ export default async function (pi: ExtensionAPI) {
     compacting = false;
     temporaryThread = undefined;
   });
-  // Do not mutate Pi's active tools. Bernard receives no tool declarations and cannot emit Pi tool calls.
+  // Pi's active tools are never changed here: their declarations travel in the run message (see tools.ts).
 }
