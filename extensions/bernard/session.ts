@@ -93,6 +93,11 @@ async function fromSafari(signal?: AbortSignal, allowBrowserLogin = true): Promi
   throw new Error("Bernard-Login nach zwei Minuten abgebrochen. In Safari anmelden und /bernard-login erneut ausführen.");
 }
 
+/** Whether a valid token is available without opening the browser. */
+export async function hasBernardToken(supplied?: string): Promise<boolean> {
+  return (await savedToken(supplied)) !== undefined;
+}
+
 export async function bernardToken(options: {
   signal?: AbortSignal;
   supplied?: string;

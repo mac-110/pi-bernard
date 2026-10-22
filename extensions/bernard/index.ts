@@ -16,10 +16,10 @@ import {
   type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI, ProviderModelConfig, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ProviderModelConfig, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { bernardToken } from "./session.js";
+import { bernardToken, hasBernardToken } from "./session.js";
 import {
   neutralizeTags,
   renderToolCall,
@@ -649,25 +649,53 @@ export default async function (pi: ExtensionAPI) {
     },
   };
 
-  let initialModels = fallback;
-  try { initialModels = await loadModels(); } catch { /* Offline or signed out: retain fallback. */ }
+  // Last successfully loaded catalog: an offline refresh must not fall back to the placeholder model.
+  let currentModels = fallback;
+  try { currentModels = await loadModels(); } catch { /* Offline or signed out: retain fallback. */ }
   pi.registerProvider("bernard", {
     api: "bernard-run",
     baseUrl: BASE,
     apiKey: "bernard-browser-session",
-    models: initialModels,
+    models: currentModels,
     async refreshModels(context) {
-      if (!context.allowNetwork) return initialModels;
-      return loadModels(context.signal);
+      if (!context.allowNetwork) return currentModels;
+      currentModels = await loadModels(context.signal);
+      return currentModels;
     },
     streamSimple: (model, context, options) => streamBernard(model, context, options, threads),
   });
+  // Pi's /model refresh is not forced, so a fresh login triggers its own forced catalog refresh.
+  const refreshCatalog = async (ctx: ExtensionContext, signal?: AbortSignal): Promise<number> => {
+    const result = await ctx.modelRegistry.refresh({ providers: ["bernard"], force: true, allowNetwork: true, signal });
+    const error = result.errors.get("bernard");
+    if (error) throw error;
+    return currentModels.length;
+  };
+  const login = async (ctx: ExtensionContext, signal?: AbortSignal): Promise<void> => {
+    await bernardToken({ force: true, signal });
+    const count = await refreshCatalog(ctx, signal);
+    ctx.ui.notify(`Bernard-Sitzung übernommen, ${count} Modelle geladen.`, "info");
+  };
+  let loginController: AbortController | undefined;
+  // Runs in the background so startup is not blocked while the user signs in.
+  const ensureSession = async (ctx: ExtensionContext): Promise<void> => {
+    if (await hasBernardToken()) return;
+    const controller = new AbortController();
+    loginController = controller;
+    ctx.ui.notify("Bernard-Token fehlt oder ist abgelaufen – Safari-Login wird geöffnet …", "info");
+    try {
+      await login(ctx, controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      if (loginController === controller) loginController = undefined;
+    }
+  };
   pi.registerCommand("bernard-login", {
     description: "Bernard-Sitzung aus Safari übernehmen (bei Bedarf Browser-Login öffnen)",
     handler: async (_args, ctx) => {
       try {
-        await bernardToken({ force: true });
-        ctx.ui.notify("Bernard-Sitzung übernommen. /model aktualisiert die Modellliste.", "info");
+        await login(ctx);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
@@ -677,7 +705,10 @@ export default async function (pi: ExtensionAPI) {
     if (event.reason === "fork") resetThread(true);
     else if (event.reason === "new") resetThread(false);
     else restoreThread(ctx.sessionManager.getBranch());
+    // Only interactive startups sign in; print/JSON runs keep the fallback. Skip users of other providers.
+    if (event.reason === "startup" && ctx.hasUI && (!ctx.model || ctx.model.provider === "bernard")) void ensureSession(ctx);
   });
+  pi.on("session_shutdown", () => loginController?.abort());
   pi.on("session_tree", () => resetThread(true));
   pi.on("model_select", (event) => {
     if (event.model.provider === "bernard" && event.previousModel && event.previousModel.provider !== "bernard") resetThread(true);

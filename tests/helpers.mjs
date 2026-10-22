@@ -116,9 +116,10 @@ export async function loadExtension(onRun) {
   let provider;
   const entries = [];
   const handlers = {};
+  const commands = {};
   const pi = {
     registerProvider: (_name, config) => { provider = config; },
-    registerCommand: () => {},
+    registerCommand: (name, command) => { commands[name] = command; },
     on: (name, handler) => { (handlers[name] ??= []).push(handler); },
     appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
   };
@@ -135,7 +136,7 @@ export async function loadExtension(onRun) {
   }
 
   const runs = () => requests.filter((request) => request.url.endsWith("/v1/agents/run"));
-  return { provider, entries, handlers, requests, runs, run, model };
+  return { provider, entries, handlers, commands, requests, runs, run, model };
 }
 
 export const readTool = {

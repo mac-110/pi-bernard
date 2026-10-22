@@ -24,7 +24,7 @@ If you already have a manually installed `~/.pi/agent/extensions/bernard/`, remo
 
 When the JWT expires, a model request can open Safari, wait up to two minutes for you to sign in, and securely read **only** `bernard.access_token` from a tab at `https://bernard.swisscom.com/`. The token comes from the site's browser storage, **not** the `/v1/me` response. No credentials are read from other sites. The cached token is kept in `~/.pi/agent/bernard-session.json` (file mode `0600`), or under `PI_CODING_AGENT_DIR` if set. Do not commit or share it. If Safari automation is disabled, Pi returns an actionable error instead of silently scraping anything.
 
-Model discovery at startup does **not** open the login page: when signed out it shows a fallback model. Sign in and open `/model` to refresh, or restart Pi.
+At interactive startup, when no valid token is available and a Bernard model is active (or none is selected), Pi opens Safari for sign-in in the background and refreshes the model list as soon as the token has been imported. `/bernard-login` also refreshes the model list. Print and JSON runs never open the login page; when signed out they use a fallback model.
 
 ### Without Safari
 
