@@ -358,8 +358,7 @@ async function uploadImage(
     }, auth, signal);
     if (!confirm.ok) throw new Error(`Bernard Bildbestätigung HTTP ${confirm.status}: ${await errorText(confirm)}`);
     let resource = (await confirm.json() as { resource: BernardResource }).resource;
-    for (let attempt = 0; resource.status !== "ready" && attempt < 30; attempt++) {
-      if (resource.status === "failed") throw new UnusableImageError(`Bernard konnte das Bild nicht verarbeiten: ${resource.failureCode ?? "unbekannter Fehler"}`);
+    for (let attempt = 0; resource.status !== "ready" && resource.status !== "failed" && attempt < 30; attempt++) {
       await delay(500, undefined, { signal });
       const lookup = await authenticatedFetch(`${BASE}/resources/lookup`, {
         method: "POST",
@@ -369,6 +368,7 @@ async function uploadImage(
       if (!lookup.ok) throw new Error(`Bernard Bildstatus HTTP ${lookup.status}: ${await errorText(lookup)}`);
       resource = (await lookup.json() as { items: BernardResource[] }).items[0] ?? resource;
     }
+    if (resource.status === "failed") throw new UnusableImageError(`Bernard konnte das Bild nicht verarbeiten: ${resource.failureCode ?? "unbekannter Fehler"}`);
     if (resource.status !== "ready") throw new Error("Bernard-Bildverarbeitung hat das Zeitlimit überschritten.");
     return resource._id;
   } catch (error) {

@@ -216,6 +216,40 @@ test("an image Bernard fails to process is skipped, a failing upload is not", as
   assert.match(failed.message.errorMessage, /Bildregistrierung HTTP 500/);
 });
 
+test("an image rejected on the final status lookup is omitted and does not block later turns", async () => {
+  const bernard = await loadExtension(() => sse(reply(["ok"])));
+  const inner = globalThis.fetch;
+  let lookups = 0;
+  const json = (value) => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (/\/v1\/resources\/[^/]+\/confirm$/.test(url)) {
+      await inner(input, init);
+      return json({ resource: { _id: "res-1", status: "pending" } });
+    }
+    if (url.endsWith("/v1/resources/lookup")) {
+      lookups++;
+      return json({ items: [{ _id: "res-1", status: lookups === 30 ? "failed" : "pending", failureCode: "unsupported_content" }] });
+    }
+    return inner(input, init);
+  };
+  const context = normalizeContext({ systemPrompt, messages: [user([
+    { type: "text", text: "Look." }, { type: "image", data: png, mimeType: "image/png" },
+  ])] });
+
+  const first = await bernard.run(context);
+  assert.equal(lookups, 30);
+  assert.equal(first.message.stopReason, "stop", first.message.errorMessage);
+  assert.equal(bernard.runs()[0].body.attachmentIds, undefined);
+  assert.ok(bernard.runs()[0].body.message.includes("[Image omitted: Bernard konnte das Bild nicht verarbeiten: unsupported_content]"));
+  assert.ok(bernard.requests.some((request) => request.url.endsWith("/v1/resources/res-1") && request.method === "DELETE"));
+
+  context.messages.push(first.message, user("Continue without the image."));
+  assert.equal((await bernard.run(context)).message.stopReason, "stop");
+  assert.equal(lookups, 30, "later turns must not retry the rejected image");
+  assert.equal(bernard.requests.filter((request) => request.url.endsWith("/v1/resources") && request.method === "POST").length, 1);
+});
+
 test("oversized tool results are clipped to Bernard's per-message limit", async () => {
   const bernard = await loadExtension((body) => bernard.runs().length === 1
     ? sse(reply([`${callBlock(body.threadId, "read", { path: "a" })}${callBlock(body.threadId, "read", { path: "b" })}`]))
