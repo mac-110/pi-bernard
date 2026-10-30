@@ -207,13 +207,11 @@ function callNumbers(messages: TranscriptMessage[]): Map<string, number> {
   return numbers;
 }
 
-/** Images in the unsent messages, in order. Tool-result images are marked so they never block the tool loop. */
-function pendingImages(messages: TranscriptMessage[]): { image: ImageContent; fromTool: boolean }[] {
+/** Images in the unsent messages, in order. None of them can block the run: see the upload loop. */
+function pendingImages(messages: TranscriptMessage[]): ImageContent[] {
   return messages.flatMap((message) => {
     if ((message.role !== "user" && message.role !== "toolResult") || typeof message.content === "string") return [];
-    return message.content
-      .filter((part): part is ImageContent => part.type === "image")
-      .map((image) => ({ image, fromTool: message.role === "toolResult" }));
+    return message.content.filter((part): part is ImageContent => part.type === "image");
   });
 }
 
@@ -313,13 +311,20 @@ async function errorText(response: Response): Promise<string> {
   return (await response.text()).slice(0, 500);
 }
 
+/**
+ * An image Bernard will never accept, however often it is sent. Such an image becomes a placeholder
+ * note instead of failing the run: a message that cannot be sent is replayed on every later run
+ * (see `pendingStart`), so a hard error here would end the session rather than one upload.
+ */
+class UnusableImageError extends Error {}
+
 function imageBytes(image: ImageContent): { bytes: Buffer; extension: string } {
   const mime = image.mimeType.toLowerCase();
   const extension = mime === "image/png" ? "png" : mime === "image/jpeg" || mime === "image/jpg" ? "jpg" : mime === "image/webp" ? "webp" : undefined;
-  if (!extension) throw new Error(`Bernard unterstützt in Pi derzeit PNG, JPEG und WebP, nicht ${image.mimeType}.`);
+  if (!extension) throw new UnusableImageError(`Bernard unterstützt in Pi derzeit PNG, JPEG und WebP, nicht ${image.mimeType}`);
   const encoded = image.data.includes(",") ? image.data.slice(image.data.indexOf(",") + 1) : image.data;
   const bytes = Buffer.from(encoded, "base64");
-  if (!bytes.length) throw new Error("Leere Bilddaten können nicht zu Bernard hochgeladen werden.");
+  if (!bytes.length) throw new UnusableImageError("leere Bilddaten");
   return { bytes, extension };
 }
 
@@ -354,7 +359,7 @@ async function uploadImage(
     if (!confirm.ok) throw new Error(`Bernard Bildbestätigung HTTP ${confirm.status}: ${await errorText(confirm)}`);
     let resource = (await confirm.json() as { resource: BernardResource }).resource;
     for (let attempt = 0; resource.status !== "ready" && attempt < 30; attempt++) {
-      if (resource.status === "failed") throw new Error(`Bernard konnte das Bild nicht verarbeiten: ${resource.failureCode ?? "unbekannter Fehler"}`);
+      if (resource.status === "failed") throw new UnusableImageError(`Bernard konnte das Bild nicht verarbeiten: ${resource.failureCode ?? "unbekannter Fehler"}`);
       await delay(500, undefined, { signal });
       const lookup = await authenticatedFetch(`${BASE}/resources/lookup`, {
         method: "POST",
@@ -463,34 +468,33 @@ function streamBernard(
         message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted")) };
       const start = pendingStart(replay.messages);
       const images = pendingImages(replay.messages.slice(start));
-      const userImages = images.filter((image) => !image.fromTool).length;
       const vision = model.input.includes("image");
-      if (userImages > MAX_IMAGES) throw new Error(`Bernard unterstützt höchstens ${MAX_IMAGES} Bilder pro Nachricht.`);
-      if (userImages && !vision) throw new Error(`${model.name} unterstützt laut Bernard-Katalog keine Bilder.`);
       const lease = threads.acquire(currentSystemSignature(replay));
       const tags = toolTags(lease.threadId);
       const tools = getCurrentTools(replay.messages);
       const toolsEnabled = tools.length > 0 && options?.toolChoice !== "none";
       const notes = tools.length && !toolsEnabled ? ["[PI] Do not call any Pi tools in this reply."] : [];
 
+      // Every image either gets uploaded or gets a note saying why not; none of them fails the run.
       const imageNotes = new Map<ImageContent, string>();
-      const uploads: ImageContent[] = [];
-      for (const { image } of images) {
-        if (!vision) imageNotes.set(image, `[Image omitted: ${model.name} cannot read images]`);
-        else if (uploads.length >= MAX_IMAGES) imageNotes.set(image, `[Image omitted: Bernard accepts at most ${MAX_IMAGES} images per message]`);
-        else {
-          uploads.push(image);
-          imageNotes.set(image, `[Image ${uploads.length} attached to this message]`);
+      for (const image of images) {
+        if (!vision) { imageNotes.set(image, `[Image omitted: ${model.name} cannot read images]`); continue; }
+        if (resourceIds.length >= MAX_IMAGES) { imageNotes.set(image, `[Image omitted: Bernard accepts at most ${MAX_IMAGES} images per message]`); continue; }
+        try {
+          resourceIds.push(await uploadImage(image, resourceIds.length, lease.threadId, auth, options?.signal));
+        } catch (error) {
+          // Only a permanently unusable image is skipped; a transient upload failure fails the run so it can be retried.
+          if (!(error instanceof UnusableImageError)) throw error;
+          imageNotes.set(image, `[Image omitted: ${error.message}]`);
+          continue;
         }
-      }
-      for (let index = 0; index < uploads.length; index++) {
-        resourceIds.push(await uploadImage(uploads[index], index, lease.threadId, auth, options?.signal));
+        imageNotes.set(image, `[Image ${resourceIds.length} attached to this message]`);
       }
       const render: RenderContext = { tags, imageNotes, callNumbers: callNumbers(replay.messages) };
       const transcript = lease.bootstrap ? bootstrapText(replay, start, render, notes) : undefined;
       const inputText = transcript?.text ?? deltaText(replay, start, render, notes);
       const requestTokens = transcript?.sourceTokens ?? Math.ceil(inputText.length / 4);
-      const contextInputTokens = (lease.bootstrap ? 0 : lease.estimatedTokens) + requestTokens + uploads.length * 1600;
+      const contextInputTokens = (lease.bootstrap ? 0 : lease.estimatedTokens) + requestTokens + resourceIds.length * 1600;
       const mode = thinkingMode(model.id, options?.reasoning);
       const payload = {
         message: inputText,

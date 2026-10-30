@@ -127,6 +127,95 @@ test("image tool results for text-only models become a note instead of an error"
   assert.ok(bernard.runs()[1].body.message.includes("[Image omitted: Bernard Text only cannot read images]"));
 });
 
+test("an image format Bernard rejects becomes a note instead of ending the session", async () => {
+  const bernard = await loadExtension((body) => bernard.runs().length === 1
+    ? sse(reply([callBlock(body.threadId, "read", { path: "ticket.png" })]))
+    : sse(reply(["ok"])));
+  const context = normalizeContext({ systemPrompt, tools: [readTool], messages: [user("Look at ticket.png")] });
+  const first = await bernard.run(context);
+  // An attachment named .png whose bytes are a GIF: Pi reports the sniffed type, not the extension.
+  context.messages.push(first.message, toolResult(first.message.content[0], [{ type: "image", data: png, mimeType: "image/gif" }]));
+  const second = await bernard.run(context);
+
+  assert.equal(second.message.stopReason, "stop", "an unusable image must not fail the run");
+  assert.equal(bernard.runs()[1].body.attachmentIds, undefined);
+  assert.ok(bernard.runs()[1].body.message.includes("[Image omitted: Bernard unterstützt in Pi derzeit PNG, JPEG und WebP, nicht image/gif]"));
+  assert.ok(!bernard.requests.some((request) => request.url.endsWith("/v1/resources") && request.method === "POST"));
+
+  // The run must succeed, or the image stays pending and every later turn fails on it again.
+  context.messages.push(second.message, user("something else entirely"));
+  assert.equal((await bernard.run(context)).message.stopReason, "stop");
+});
+
+test("a skipped image does not shift the numbering of the images around it", async () => {
+  const bernard = await loadExtension((body) => bernard.runs().length === 1
+    ? sse(reply([callBlock(body.threadId, "read", { path: "both" })]))
+    : sse(reply(["ok"])));
+  const context = normalizeContext({ systemPrompt, tools: [readTool], messages: [user("Look at both.")] });
+  const first = await bernard.run(context);
+  context.messages.push(first.message, toolResult(first.message.content[0], [
+    { type: "image", data: png, mimeType: "image/gif" },
+    { type: "image", data: png, mimeType: "image/png" },
+  ]));
+  await bernard.run(context);
+
+  const { attachmentIds, message } = bernard.runs()[1].body;
+  assert.deepEqual(attachmentIds, ["res-1"]);
+  assert.ok(message.includes("nicht image/gif]\n[Image 1 attached to this message]"));
+});
+
+test("more images than Bernard accepts are noted instead of failing the run", async () => {
+  const bernard = await loadExtension(() => sse(reply(["ok"])));
+  const images = Array.from({ length: 7 }, () => ({ type: "image", data: png, mimeType: "image/png" }));
+  const context = normalizeContext({ systemPrompt, messages: [user([{ type: "text", text: "Look at these." }, ...images])] });
+  const { message } = await bernard.run(context);
+
+  assert.equal(message.stopReason, "stop");
+  assert.deepEqual(bernard.runs()[0].body.attachmentIds, ["res-1", "res-2", "res-3", "res-4", "res-5"]);
+  assert.ok(bernard.runs()[0].body.message.includes("[Image omitted: Bernard accepts at most 5 images per message]"));
+});
+
+test("a user image sent to a text-only model is noted instead of failing the run", async () => {
+  const bernard = await loadExtension(() => sse(reply(["ok"])));
+  const context = normalizeContext({ systemPrompt, messages: [user([{ type: "text", text: "Look." }, { type: "image", data: png, mimeType: "image/png" }])] });
+  const { message } = await bernard.run(context, {}, "text-only");
+
+  assert.equal(message.stopReason, "stop");
+  assert.equal(bernard.runs()[0].body.attachmentIds, undefined);
+  assert.ok(bernard.runs()[0].body.message.includes("[Image omitted: Bernard Text only cannot read images]"));
+});
+
+test("an image Bernard fails to process is skipped, a failing upload is not", async () => {
+  let resourceStatus = "failed";
+  const bernard = await loadExtension(() => sse(reply(["ok"])));
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (/\/v1\/resources\/[^/]+\/confirm$/.test(url)) {
+      await inner(input, init);
+      return new Response(JSON.stringify({ resource: { _id: "res-1", mimeType: "image/png", status: resourceStatus, failureCode: "unsupported_content" } }),
+        { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/v1/resources") && init.method === "POST" && resourceStatus === "error") {
+      await inner(input, init);
+      return new Response("boom", { status: 500 });
+    }
+    return inner(input, init);
+  };
+  const image = () => user([{ type: "text", text: "Look." }, { type: "image", data: png, mimeType: "image/png" }]);
+
+  const rejected = await bernard.run(normalizeContext({ systemPrompt, messages: [image()] }));
+  assert.equal(rejected.message.stopReason, "stop");
+  assert.ok(bernard.runs()[0].body.message.includes("[Image omitted: Bernard konnte das Bild nicht verarbeiten: unsupported_content]"));
+  assert.ok(bernard.requests.some((request) => request.url.endsWith("/v1/resources/res-1") && request.method === "DELETE"));
+
+  // A transient upload failure must still fail the run, so Pi can retry it.
+  resourceStatus = "error";
+  const failed = await bernard.run(normalizeContext({ systemPrompt, messages: [image()] }));
+  assert.equal(failed.message.stopReason, "error");
+  assert.match(failed.message.errorMessage, /Bildregistrierung HTTP 500/);
+});
+
 test("oversized tool results are clipped to Bernard's per-message limit", async () => {
   const bernard = await loadExtension((body) => bernard.runs().length === 1
     ? sse(reply([`${callBlock(body.threadId, "read", { path: "a" })}${callBlock(body.threadId, "read", { path: "b" })}`]))
