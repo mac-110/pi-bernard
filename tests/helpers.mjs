@@ -8,13 +8,38 @@ import { fileURLToPath } from "node:url";
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+function isPi(dir) {
+  const manifest = join(dir, "package.json");
+  return existsSync(manifest) && JSON.parse(readFileSync(manifest, "utf8")).name === "@earendil-works/pi-coding-agent";
+}
+
+/** Pi's managed installer uses a shell launcher that runs install/releases/<current-version>. */
+function managedRoot(installRoot) {
+  try {
+    const version = readFileSync(join(installRoot, "current-version"), "utf8").trim();
+    const dir = join(installRoot, "releases", version, "node_modules", "@earendil-works", "pi-coding-agent");
+    return isPi(dir) ? dir : undefined;
+  } catch { return undefined; }
+}
+
 function piRoot() {
   if (process.env.PI_PACKAGE_DIR) return process.env.PI_PACKAGE_DIR;
-  let dir = dirname(realpathSync(execFileSync("sh", ["-c", "command -v pi"], { encoding: "utf8" }).trim()));
-  for (; dir !== dirname(dir); dir = dirname(dir)) {
-    const manifest = join(dir, "package.json");
-    if (existsSync(manifest) && JSON.parse(readFileSync(manifest, "utf8")).name === "@earendil-works/pi-coding-agent") return dir;
+  const fromEnv = process.env.PI_MANAGED_INSTALL_ROOT && managedRoot(process.env.PI_MANAGED_INSTALL_ROOT);
+  if (fromEnv) return fromEnv;
+  let launcher;
+  try { launcher = realpathSync(execFileSync("sh", ["-c", "command -v pi"], { encoding: "utf8" }).trim()); } catch { /* pi is not on PATH */ }
+  if (launcher) {
+    // Managed install: ~/.pi/agent/bin/pi next to ~/.pi/agent/install.
+    const managed = managedRoot(join(dirname(dirname(launcher)), "install"));
+    if (managed) return managed;
+    // npm install: the launcher links into the package.
+    for (let dir = dirname(launcher); dir !== dirname(dir); dir = dirname(dir)) {
+      if (isPi(dir)) return dir;
+    }
   }
+  // Without an installed Pi, as in CI: the devDependency.
+  const local = join(repo, "node_modules", "@earendil-works", "pi-coding-agent");
+  if (isPi(local)) return local;
   throw new Error("Pi installation not found. Install Pi or set PI_PACKAGE_DIR.");
 }
 
@@ -46,6 +71,7 @@ const jiti = createJiti(import.meta.url, {
 
 export const ai = await jiti.import("@earendil-works/pi-ai/compat");
 export const tools = await jiti.import(join(repo, "extensions/bernard/tools.ts"));
+export const session = await jiti.import(join(repo, "extensions/bernard/session.ts"));
 
 export const catalog = [
   { _id: "claude-sonnet-4-6", displayName: "Sonnet 4.6", contextWindow: 200000, capabilities: ["functionCalling", "vision"], inputModalities: ["text", "image"], thinking: { modes: ["off", "adaptive"] } },
@@ -87,9 +113,10 @@ export function reply(deltas, finishReason = "stop", ricoId = crypto.randomUUID(
 
 /**
  * Loads the extension with a mocked Bernard API. `onRun(body, init)` returns the SSE response for
- * each /v1/agents/run request. Every request is recorded in `requests`.
+ * each /v1/agents/run request; `options.onModels(init)` replaces the /v1/models response. Every
+ * request is recorded in `requests`.
  */
-export async function loadExtension(onRun) {
+export async function loadExtension(onRun, options = {}) {
   const requests = [];
   const resources = new Map();
   globalThis.fetch = async (input, init = {}) => {
@@ -98,7 +125,7 @@ export async function loadExtension(onRun) {
     const body = typeof init.body === "string" && init.body ? JSON.parse(init.body) : init.body;
     requests.push({ url, method, body });
     const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
-    if (url.endsWith("/v1/models")) return json({ items: catalog });
+    if (url.endsWith("/v1/models")) return options.onModels ? options.onModels(init) : json({ items: catalog });
     if (url.endsWith("/v1/agents/run")) return onRun(body, init);
     if (url.endsWith("/v1/resources") && method === "POST") {
       const resource = { _id: `res-${resources.size + 1}`, mimeType: "image/png", status: "pending" };

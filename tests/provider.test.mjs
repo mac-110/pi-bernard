@@ -444,7 +444,8 @@ test("tool results from a failed run are sent again with the next user turn", as
   const bernard = await loadExtension((body) => {
     const run = bernard.runs().length;
     if (run === 1) return sse(reply([callBlock(body.threadId, "read", { path: "a" })], "stop", "reply-1"));
-    if (run === 2) return new Response(JSON.stringify({ error: { code: "unavailable" } }), { status: 503 });
+    // 500 is not retried, so the run fails for good.
+    if (run === 2) return new Response(JSON.stringify({ error: { code: "internal" } }), { status: 500 });
     return sse(reply(["ok"], "stop", "reply-3"));
   });
   const context = normalizeContext({ systemPrompt, tools: [readTool], messages: [user("Read a.")] });
@@ -459,4 +460,53 @@ test("tool results from a failed run are sent again with the next user turn", as
   assert.equal(parentMessageId, "reply-1");
   assert.ok(message.includes("status=\"ok\">\nA\n"));
   assert.ok(message.endsWith("[USER]\ncontinue"));
+});
+
+test("a 503 or 429 from Bernard is retried before the run fails", async () => {
+  let attempts = 0;
+  const bernard = await loadExtension(() => {
+    attempts++;
+    if (attempts === 1) return new Response("busy", { status: 503, headers: { "retry-after": "0" } });
+    if (attempts === 2) return new Response("slow down", { status: 429, headers: { "retry-after": "0" } });
+    return sse(reply(["ok"]));
+  });
+  const { message } = await bernard.run(normalizeContext({ systemPrompt, messages: [user("Hi")] }));
+  assert.equal(message.stopReason, "stop");
+  assert.equal(attempts, 3);
+
+  attempts = 0;
+  const failing = await loadExtension(() => { attempts++; return new Response("busy", { status: 503, headers: { "retry-after": "0" } }); });
+  const failed = await failing.run(normalizeContext({ systemPrompt, messages: [user("Hi")] }));
+  assert.equal(failed.message.stopReason, "error");
+  assert.match(failed.message.errorMessage, /HTTP 503/);
+  assert.equal(attempts, 3, "one request plus two retries");
+});
+
+test("an unreadable stream event is skipped instead of failing the reply", async () => {
+  const [start, meta, ...rest] = reply(["Hallo ", "Welt"]);
+  const bernard = await loadExtension(() => sse([start, meta, "data: {not json\n\n", ...rest]));
+  const { message } = await bernard.run(normalizeContext({ systemPrompt, messages: [user("Hi")] }));
+  assert.equal(message.stopReason, "stop");
+  assert.equal(message.content[0].text, "Hallo Welt");
+});
+
+test("several images upload in parallel and keep their order", async () => {
+  const bernard = await loadExtension(() => sse(reply(["ok"])));
+  const inner = globalThis.fetch;
+  let active = 0;
+  let peak = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    if (!String(input).startsWith("https://upload.test/")) return inner(input, init);
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    active--;
+    return inner(input, init);
+  };
+  const images = Array.from({ length: 3 }, () => ({ type: "image", data: png, mimeType: "image/png" }));
+  await bernard.run(normalizeContext({ systemPrompt, messages: [user([{ type: "text", text: "Look." }, ...images])] }));
+  const { attachmentIds, message } = bernard.runs()[0].body;
+  assert.deepEqual(attachmentIds, ["res-1", "res-2", "res-3"]);
+  assert.ok(message.includes("[Image 1 attached to this message]\n[Image 2 attached to this message]\n[Image 3 attached to this message]"));
+  assert.ok(peak > 1, "uploads overlap");
 });
