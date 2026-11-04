@@ -63,10 +63,12 @@ With tool use, Bernard models can trigger local actions through Pi's tools with 
 ```sh
 pi --no-extensions -e ./extensions/bernard/index.ts --list-models bernard
 pi --no-extensions -e ./extensions/bernard/index.ts -p --model bernard/claude-sonnet-4-6 "Say OK"
+npm install            # dev dependencies: Pi, TypeScript
+npm run typecheck      # tsc --noEmit over extensions/
 npm test               # unit and provider tests against a mocked Bernard API
 tests/smoke.sh         # installs the package; with BERNARD_TOKEN also runs a real tool call
 ```
 
-The tests need Node 22 and an installed Pi: they load the TypeScript sources through Pi's bundled `jiti` with the same module aliases as Pi's extension loader (set `PI_PACKAGE_DIR` if `pi` is not on `PATH`). They use a temporary agent directory and a fake token, so they never read your Bernard session or open Safari.
+The tests need Node 22 and an installed Pi: they load the TypeScript sources through Pi's bundled `jiti` with the same module aliases as Pi's extension loader (set `PI_PACKAGE_DIR` to override; without an installed Pi, as in CI, they use the Pi devDependency). They use a temporary agent directory and a fake token, so they never read your Bernard session or open Safari.
 
 MIT licensed. Community-maintained; endpoint behavior may change.

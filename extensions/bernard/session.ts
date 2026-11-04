@@ -67,7 +67,48 @@ function safariError(error: unknown): Error | undefined {
   }
 }
 
-let pending: Promise<string> | undefined;
+interface SharedLogin { promise: Promise<string>; controller: AbortController; waiters: number }
+let shared: SharedLogin | undefined;
+
+/**
+ * Concurrent requests share one browser login. Each caller can abort its own wait; the login itself
+ * stops only once every caller has given up.
+ */
+function joinLogin(signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) return Promise.reject(new Error("Bernard-Login abgebrochen."));
+  if (!shared) {
+    const controller = new AbortController();
+    const created: SharedLogin = {
+      controller,
+      waiters: 0,
+      promise: fromSafari(controller.signal).finally(() => { if (shared === created) shared = undefined; }),
+    };
+    shared = created;
+  }
+  const login = shared;
+  login.waiters++;
+  return new Promise<string>((resolve, reject) => {
+    let done = false;
+    const settle = () => {
+      if (done) return false;
+      done = true;
+      login.waiters--;
+      signal?.removeEventListener("abort", onAbort);
+      return true;
+    };
+    const onAbort = () => {
+      if (!settle()) return;
+      if (login.waiters === 0) {
+        if (shared === login) shared = undefined;
+        login.controller.abort();
+      }
+      reject(new Error("Bernard-Login abgebrochen."));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    login.promise.then((token) => { if (settle()) resolve(token); }, (error) => { if (settle()) reject(error); });
+  });
+}
+
 async function fromSafari(signal?: AbortSignal, allowBrowserLogin = true): Promise<string> {
   if (process.platform !== "darwin") throw new Error("Automatischer Browser-Login benötigt macOS/Safari. Alternativ BERNARD_TOKEN setzen.");
   try {
@@ -108,7 +149,7 @@ export async function bernardToken(options: {
     const token = await savedToken(options.supplied);
     if (token) return token;
   }
-  // A model refresh and a request can share the same browser login.
-  pending ??= fromSafari(options.signal, options.allowBrowserLogin ?? true).finally(() => { pending = undefined; });
-  return pending;
+  // Without a browser login the Safari tab is read once; that neither waits for nor fails a login in progress.
+  if (options.allowBrowserLogin === false) return fromSafari(options.signal, false);
+  return joinLogin(options.signal);
 }

@@ -38,6 +38,11 @@ const MAX_IMAGES = 5;
 // /v1/agents/run validates `message` at 50,000 characters, independently of the model context window.
 const MAX_MESSAGE_CHARS = 48_000;
 const MAX_SYSTEM_CHARS = 16_000;
+// 429 and 503 mean Bernard did not take the request, so it is sent again unchanged. A 502 may come
+// after the request was passed on, and repeating a run could then start it twice.
+const RETRY_STATUSES = new Set([429, 503]);
+const MAX_RETRIES = 2;
+const MODELS_TIMEOUT_MS = 5000;
 const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const imageResize = { maxWidth: 2000, maxHeight: 2000, maxBytes: 10 * 1024 * 1024, jpegQuality: 80 };
 const modes = new Map<string, string[]>();
@@ -51,7 +56,7 @@ interface BernardModelItem {
   thinking?: { modes?: string[] };
 }
 
-interface AuthState { token: string }
+interface AuthState { token: string; allowBrowserLogin?: boolean }
 interface BernardResource { _id: string; mimeType: string; status?: string; failureCode?: string }
 // `messageId` is Bernard's id of the last committed reply; later runs attach to it as parent.
 interface StoredThreadState { threadId?: string; estimatedTokens?: number; systemSignature?: string; messageId?: string }
@@ -292,16 +297,32 @@ function authHeaders(token: string, json = false): Record<string, string> {
   };
 }
 
+function retryDelay(response: Response, attempt: number): number {
+  const header = response.headers.get("retry-after");
+  const seconds = header === null ? Number.NaN : Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, 10_000) : 1000 * 2 ** attempt;
+}
+
+async function withRetry(send: () => Promise<Response>, signal?: AbortSignal): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const response = await send();
+    if (!RETRY_STATUSES.has(response.status) || attempt >= MAX_RETRIES) return response;
+    await response.body?.cancel().catch(() => undefined);
+    await delay(retryDelay(response, attempt), undefined, { signal });
+  }
+}
+
 async function authenticatedFetch(
   url: string,
   init: RequestInit,
   auth: AuthState,
   signal?: AbortSignal,
 ): Promise<Response> {
-  const send = () => fetch(url, { ...init, signal, headers: { ...init.headers, ...authHeaders(auth.token) } });
+  const send = () => withRetry(() => fetch(url, { ...init, signal, headers: { ...init.headers, ...authHeaders(auth.token) } }), signal);
   let response = await send();
   if (response.status === 401) {
-    auth.token = await bernardToken({ signal, force: true });
+    await response.body?.cancel().catch(() => undefined);
+    auth.token = await bernardToken({ signal, force: true, allowBrowserLogin: auth.allowBrowserLogin });
     response = await send();
   }
   return response;
@@ -318,7 +339,9 @@ async function errorText(response: Response): Promise<string> {
  */
 class UnusableImageError extends Error {}
 
-function imageBytes(image: ImageContent): { bytes: Buffer; extension: string } {
+type ImageFile = { bytes: Buffer; extension: string };
+
+function imageBytes(image: ImageContent): ImageFile {
   const mime = image.mimeType.toLowerCase();
   const extension = mime === "image/png" ? "png" : mime === "image/jpeg" || mime === "image/jpg" ? "jpg" : mime === "image/webp" ? "webp" : undefined;
   if (!extension) throw new UnusableImageError(`Bernard unterstützt in Pi derzeit PNG, JPEG und WebP, nicht ${image.mimeType}`);
@@ -329,13 +352,13 @@ function imageBytes(image: ImageContent): { bytes: Buffer; extension: string } {
 }
 
 async function uploadImage(
-  image: ImageContent,
+  file: ImageFile,
   index: number,
   threadId: string,
   auth: AuthState,
   signal?: AbortSignal,
 ): Promise<string> {
-  const { bytes, extension } = imageBytes(image);
+  const { bytes, extension } = file;
   const create = await authenticatedFetch(`${BASE}/resources`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -477,19 +500,37 @@ function streamBernard(
 
       // Every image either gets uploaded or gets a note saying why not; none of them fails the run.
       const imageNotes = new Map<ImageContent, string>();
+      const uploads: { image: ImageContent; file: ImageFile }[] = [];
       for (const image of images) {
         if (!vision) { imageNotes.set(image, `[Image omitted: ${model.name} cannot read images]`); continue; }
-        if (resourceIds.length >= MAX_IMAGES) { imageNotes.set(image, `[Image omitted: Bernard accepts at most ${MAX_IMAGES} images per message]`); continue; }
+        let file: ImageFile;
         try {
-          resourceIds.push(await uploadImage(image, resourceIds.length, lease.threadId, auth, options?.signal));
+          file = imageBytes(image);
         } catch (error) {
-          // Only a permanently unusable image is skipped; a transient upload failure fails the run so it can be retried.
           if (!(error instanceof UnusableImageError)) throw error;
           imageNotes.set(image, `[Image omitted: ${error.message}]`);
           continue;
         }
-        imageNotes.set(image, `[Image ${resourceIds.length} attached to this message]`);
+        if (uploads.length >= MAX_IMAGES) { imageNotes.set(image, `[Image omitted: Bernard accepts at most ${MAX_IMAGES} images per message]`); continue; }
+        uploads.push({ image, file });
       }
+      // Uploads run in parallel; attachment numbers still follow the order of the images.
+      const settled = await Promise.allSettled(uploads.map(({ file }, index) => uploadImage(file, index, lease.threadId, auth, options?.signal)));
+      let transient: unknown;
+      settled.forEach((outcome, index) => {
+        const { image } = uploads[index];
+        if (outcome.status === "fulfilled") {
+          resourceIds.push(outcome.value);
+          imageNotes.set(image, `[Image ${resourceIds.length} attached to this message]`);
+        } else if (outcome.reason instanceof UnusableImageError) {
+          imageNotes.set(image, `[Image omitted: ${outcome.reason.message}]`);
+        } else {
+          transient ??= outcome.reason;
+        }
+      });
+      // Only a permanently unusable image is skipped; a transient upload failure fails the run so it can be retried.
+      // Uploaded images are in resourceIds and are deleted in `finally`.
+      if (transient !== undefined) throw transient;
       const render: RenderContext = { tags, imageNotes, callNumbers: callNumbers(replay.messages) };
       const transcript = lease.bootstrap ? bootstrapText(replay, start, render, notes) : undefined;
       const inputText = transcript?.text ?? deltaText(replay, start, render, notes);
@@ -533,9 +574,12 @@ function streamBernard(
         if (!lines.length) return;
         const data = lines.map((line) => line.slice(5).trimStart()).join("\n");
         if (data === "[DONE]") return;
-        const event = JSON.parse(data) as {
+        type StreamEvent = {
           type?: string; delta?: string; error?: string | { message?: string }; finishReason?: string; messageMetadata?: { ricoId?: string };
         };
+        let event: StreamEvent;
+        // One unreadable event must not end an otherwise intact reply; Bernard reports errors as `error` events.
+        try { event = JSON.parse(data) as StreamEvent; } catch { return; }
         if (event.type === "message-metadata" && event.messageMetadata?.ricoId) messageId = event.messageMetadata.ricoId;
         if (event.type === "error") throw new Error(typeof event.error === "string" ? event.error : event.error?.message ?? "Bernard stream error");
         if (event.type === "reasoning-start") appendThinking("");
@@ -592,8 +636,12 @@ function streamBernard(
 }
 
 async function loadModels(signal?: AbortSignal): Promise<ProviderModelConfig[]> {
-  const token = await bernardToken({ signal, allowBrowserLogin: false });
-  const response = await fetch(`${BASE}/models`, { headers: authHeaders(token), signal });
+  // A hanging network must block neither Pi's startup nor /model.
+  const timeout = AbortSignal.timeout(MODELS_TIMEOUT_MS);
+  const bounded = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  // The model list never opens the browser; a rejected token is only renewed from an open Safari tab.
+  const auth: AuthState = { token: await bernardToken({ signal: bounded, allowBrowserLogin: false }), allowBrowserLogin: false };
+  const response = await authenticatedFetch(`${BASE}/models`, {}, auth, bounded);
   if (!response.ok) throw new Error(`Bernard Modellliste HTTP ${response.status}`);
   const data = await response.json() as { items?: BernardModelItem[] };
   if (!Array.isArray(data.items) || !data.items.length) throw new Error("Bernard Modellliste leer");
