@@ -277,6 +277,51 @@ function replayable(messages: TranscriptMessage[]): { messages: TranscriptMessag
   return { messages: kept, withheld: new Set(notes.values()) };
 }
 
+function partsText(content: string | readonly ({ type: "text"; text: string } | { type: "image"; mimeType: string })[]): string {
+  if (typeof content === "string") return content;
+  return content.map((part) => part.type === "text" ? part.text : `[Bild ${part.mimeType}]`).join("\n");
+}
+
+/**
+ * Lists, for every gateway rejection in the session (all branches), what that request sent for the first
+ * time: the messages back to the last successful reply or the previous rejection, whose content was
+ * already left out. Undefined if nothing was rejected.
+ */
+function rejectionReport(entries: SessionEntry[], branch: (id: string) => SessionEntry[]): string | undefined {
+  const sections: string[] = [];
+  for (const entry of entries) {
+    if (entry.type !== "message" || !isGatewayRejection(entry.message as TranscriptMessage)) continue;
+    const items: string[] = [];
+    let earlier = false;
+    const path = branch(entry.id);
+    for (let index = path.length - 2; index >= 0; index--) {
+      const previous = path[index];
+      if (previous.type !== "message") continue;
+      const message = previous.message;
+      if (message.role === "assistant") {
+        if (message.stopReason !== "error" && message.stopReason !== "aborted") break;
+        if (isGatewayRejection(message as TranscriptMessage)) { earlier = true; break; }
+        continue;
+      }
+      if (message.role === "user") items.unshift(`── Nachricht ──\n${partsText(message.content)}`);
+      else if (message.role === "toolResult") items.unshift(`── Toolergebnis ${message.toolName} ──\n${partsText(message.content)}`);
+      else if (message.role === "bashExecution" && !message.excludeFromContext) items.unshift(`── Shell-Befehl !${message.command} ──\n${message.output}`);
+      else if (message.role === "custom") items.unshift(`── Erweiterung ${message.customType} ──\n${partsText(message.content)}`);
+    }
+    const rejected = entry.message;
+    const when = new Date(rejected.timestamp).toLocaleString("de-CH");
+    const model = rejected.role === "assistant" ? ` · ${rejected.model}` : "";
+    const elsewhere = "in den Pi-Anweisungen, in Tooldefinitionen oder im älteren Verlauf eines neuen Bernard-Threads";
+    const hint = earlier
+      ? `Die vorherige Anfrage wurde schon abgelehnt, ihre Inhalte fehlten hier bereits. Der Auslöser kann deshalb auch ${elsewhere} liegen.`
+      : items.length ? "" : `Die Anfrage enthielt keine neuen Nachrichten. Der Auslöser liegt vermutlich ${elsewhere}.`;
+    sections.push([`━━ Ablehnung ${sections.length + 1} · ${when}${model} ━━`, hint, ...items].filter(Boolean).join("\n\n"));
+  }
+  if (!sections.length) return undefined;
+  return [`Bernards Gateway hat in dieser Session ${sections.length === 1 ? "eine Anfrage" : `${sections.length} Anfragen`} abgelehnt. `
+    + "Aufgeführt ist, was jede Anfrage neu gesendet hat. Pi sendet diese Inhalte nicht erneut.", ...sections].join("\n\n");
+}
+
 function isGatewayPage(response: Response, body: string): boolean {
   return response.status === 403 && ((response.headers.get("content-type") ?? "").includes("text/html") || body.trimStart().startsWith("<"));
 }
@@ -817,6 +862,16 @@ export default async function (pi: ExtensionAPI) {
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
+    },
+  });
+  // Shown in a dialog only: a message in the session would be sent to the model and rejected again.
+  pi.registerCommand("bernard-rejected", {
+    description: "Von Bernards Gateway abgelehnte Nachrichten dieser Session anzeigen",
+    handler: async (_args, ctx) => {
+      const { sessionManager } = ctx;
+      const report = rejectionReport(sessionManager.getEntries(), (id) => sessionManager.getBranch(id));
+      if (!report) ctx.ui.notify("Bernards Gateway hat in dieser Session keine Anfrage abgelehnt.", "info");
+      else await ctx.ui.editor("Von Bernards Gateway abgelehnt (Esc schließt, Ctrl+G öffnet den externen Editor)", report);
     },
   });
   pi.on("session_start", (event, ctx) => {

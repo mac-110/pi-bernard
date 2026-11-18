@@ -200,3 +200,46 @@ test("compaction with Bernard summarizes the notes, not the rejected messages", 
   // Other providers sit behind no such gateway and summarize the original.
   assert.ok(JSON.stringify(compact("anthropic")).includes(BLOCKED));
 });
+
+test("/bernard-rejected lists what each rejected request sent, across branches", async () => {
+  const bernard = await blockingBernard();
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const assistant = (stopReason, errorMessage) => ({ role: "assistant", api: "bernard-run", provider: "bernard", model: "claude-sonnet-4-6",
+    content: [{ type: "text", text: "answer" }], usage, stopReason, errorMessage, timestamp: Date.now() });
+  const rejection = "Bernard-Gateway hat die Anfrage abgelehnt (HTTP 403). Vermutlich …";
+  const call = { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a" } };
+  const messages = {
+    u1: user("hello"), a1: { ...assistant("toolUse"), content: [call] },
+    r1: toolResult(call, [{ type: "text", text: `secret ${BLOCKED}` }, { type: "image", data: png, mimeType: "image/png" }]),
+    e1: assistant("error", rejection),
+    u2: user("still there?"), e2: assistant("error", `${rejection.slice(0, 52)}, obwohl …`),
+    // Another branch from a1: a plain server error is not listed, its message is part of the next rejection.
+    b1: { role: "bashExecution", command: "cat config", output: `${BLOCKED} in output`, exitCode: 0, cancelled: false, truncated: false, timestamp: Date.now() },
+    x1: assistant("error", "Bernard HTTP 500: {}"), u3: user("again"), e3: assistant("error", `Bernard HTTP 403: <html>`),
+  };
+  const parents = { u1: null, a1: "u1", r1: "a1", e1: "r1", u2: "e1", e2: "u2", b1: "a1", x1: "b1", u3: "x1", e3: "u3" };
+  const entries = Object.entries(messages).map(([id, message]) => ({ type: "message", id, parentId: parents[id], timestamp: "", message }));
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const sessionManager = {
+    getEntries: () => entries,
+    getBranch: (id) => { const path = []; for (let entry = byId.get(id); entry; entry = byId.get(entry.parentId)) path.unshift(entry); return path; },
+  };
+  let shown;
+  const notes = [];
+  const ui = { editor: async (title, text) => { shown = { title, text }; return undefined; }, notify: (text) => notes.push(text) };
+  await bernard.commands["bernard-rejected"].handler("", { sessionManager, ui, hasUI: true });
+
+  const sections = shown.text.split(/━━ Ablehnung \d+ · /);
+  assert.equal(sections.length, 4, shown.text);
+  assert.ok(sections[0].startsWith("Bernards Gateway hat in dieser Session 3 Anfragen abgelehnt."));
+  assert.ok(sections[1].includes(`── Toolergebnis read ──\nsecret ${BLOCKED}\n[Bild image/png]`));
+  assert.ok(!sections[1].includes("hello"), "messages before the last successful reply were not part of the request");
+  assert.ok(sections[2].includes("── Nachricht ──\nstill there?"));
+  assert.ok(sections[2].includes("Die vorherige Anfrage wurde schon abgelehnt"));
+  assert.ok(!sections[2].includes(BLOCKED), "the earlier rejected content was not sent again");
+  assert.ok(sections[3].indexOf(`── Shell-Befehl !cat config ──\n${BLOCKED} in output`) < sections[3].indexOf("── Nachricht ──\nagain"));
+  assert.equal(notes.length, 0);
+
+  await bernard.commands["bernard-rejected"].handler("", { sessionManager: { getEntries: () => [], getBranch: () => [] }, ui, hasUI: true });
+  assert.deepEqual(notes, ["Bernards Gateway hat in dieser Session keine Anfrage abgelehnt."]);
+});
