@@ -224,6 +224,63 @@ const BOOTSTRAP_INTRO = "I'm using you through Pi, an open-source coding agent t
 
 const RESULTS_NOTE = "[PI] Results of the tool calls in your previous reply. Pi ignored anything written after your last tool call.";
 
+/**
+ * A gateway in front of Bernard's API (nginx, apparently a web application firewall) answers some runs
+ * with an HTML "403 Forbidden" page instead of a JSON error, depending on words or patterns in the
+ * message. The same content is rejected every time, so the failed reply carries this marker and later
+ * runs send a note in place of the rejected messages (see `replayable`). It must match neither Pi's
+ * retry nor its context-overflow patterns: Pi would resend or compact the blocked text.
+ */
+const GATEWAY_REJECTED = "Bernard-Gateway hat die Anfrage abgelehnt (HTTP 403)";
+// Older versions reported the same rejection as "Bernard HTTP 403: <html>…"; sessions they blocked recover too.
+const LEGACY_REJECTION = /^Bernard HTTP 403: \s*</;
+const WITHHELD_MESSAGE = "[PI] Bernard's gateway rejected the request that carried this message (HTTP 403), probably because of words or patterns in it, so the message never reached you and is not sent again. Ask me to rephrase it if you need it.";
+const WITHHELD_RESULT = "[PI] Bernard's gateway rejected the request that carried this result (HTTP 403), probably because of words or patterns in it, so the result never reached you and is not sent again. Repeating the same call unchanged will likely be rejected again.";
+
+function isGatewayRejection(message: TranscriptMessage): boolean {
+  if (message.role !== "assistant" || message.stopReason !== "error" || !message.errorMessage) return false;
+  return message.errorMessage.startsWith(GATEWAY_REJECTED) || LEGACY_REJECTION.test(message.errorMessage);
+}
+
+/** Notes that replace the user messages and tool results the gateway rejected, keyed by the original. */
+function rejectedMessages(messages: TranscriptMessage[]): Map<TranscriptMessage, TranscriptMessage> {
+  const notes = new Map<TranscriptMessage, TranscriptMessage>();
+  // Index of the first message after the last successful reply.
+  let segment = 0;
+  messages.forEach((message, position) => {
+    if (message.role !== "assistant") return;
+    if (message.stopReason !== "error" && message.stopReason !== "aborted") {
+      segment = position + 1;
+    } else if (isGatewayRejection(message)) {
+      // A run carries everything after the last successful reply, so the gateway rejected all of it.
+      for (const rejected of messages.slice(segment, position)) {
+        if (notes.has(rejected)) continue;
+        if (rejected.role === "user") notes.set(rejected, { ...rejected, content: WITHHELD_MESSAGE });
+        if (rejected.role === "toolResult") notes.set(rejected, { ...rejected, content: [{ type: "text", text: WITHHELD_RESULT }], isError: true });
+      }
+    }
+  });
+  return notes;
+}
+
+/**
+ * The transcript as Bernard should see it. Failed and aborted replies are skipped, like in Pi's built-in
+ * providers, so the messages after the last successful reply are sent again with the next run. Messages
+ * the gateway rejected are not: they would fail the same way and block every later run. Their user
+ * messages and tool results are replaced with a note; prompt and tool updates are kept.
+ */
+function replayable(messages: TranscriptMessage[]): { messages: TranscriptMessage[]; withheld: Set<TranscriptMessage> } {
+  const notes = rejectedMessages(messages);
+  const kept = messages
+    .filter((message) => message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted"))
+    .map((message) => notes.get(message) ?? message);
+  return { messages: kept, withheld: new Set(notes.values()) };
+}
+
+function isGatewayPage(response: Response, body: string): boolean {
+  return response.status === 403 && ((response.headers.get("content-type") ?? "").includes("text/html") || body.trimStart().startsWith("<"));
+}
+
 /** The first run of a thread synchronizes the prompt, the tool protocol, and as much history as fits. */
 function bootstrapText(context: TranscriptContext, start: number, render: RenderContext, notes: string[]): { text: string; sourceTokens: number } {
   const system = getCurrentSystemMessage(context.messages);
@@ -485,10 +542,10 @@ function streamBernard(
     };
     try {
       auth.token = await bernardToken({ signal: options?.signal, supplied: options?.apiKey });
-      // Like Pi's built-in providers, skip failed replies. Runs attach to the last successful reply,
-      // so the messages after it (including the failed turn's user message) are sent again.
-      const replay = { ...context, messages: context.messages.filter((message) =>
-        message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted")) };
+      // Runs attach to the last successful reply, so the messages after it are sent again, except
+      // those the gateway rejected (see `replayable`).
+      const { messages: replayed, withheld } = replayable(context.messages);
+      const replay = { ...context, messages: replayed };
       const start = pendingStart(replay.messages);
       const images = pendingImages(replay.messages.slice(start));
       const vision = model.input.includes("image");
@@ -561,6 +618,15 @@ function streamBernard(
       if (!response.ok) {
         const details = await errorText(response);
         if (response.status === 422 && details.includes("too_big")) throw new Error("context_length_exceeded: Bernard run message exceeds 50,000 characters.");
+        // The HTML page itself is left out: it says nothing more, and its numbers could match Pi's retry patterns.
+        if (isGatewayPage(response, details)) {
+          // Rejected again since the last successful reply, although the rejected content was left out.
+          const repeated = replay.messages.slice(replay.messages.findLastIndex((message) => message.role === "assistant") + 1)
+            .some((message) => withheld.has(message));
+          throw new Error(repeated
+            ? `${GATEWAY_REJECTED}, obwohl die zuvor abgelehnten Inhalte nicht mehr mitgesendet wurden. Wenn die neue Nachricht nichts Auffälliges enthält, stehen die blockierten Inhalte vermutlich in den Pi-Anweisungen (z. B. AGENTS.md), in Tooldefinitionen oder im älteren Verlauf, den Pi an einen neuen Bernard-Thread überträgt.`
+            : `${GATEWAY_REJECTED}. Vermutlich blockiert eine Web Application Firewall vor Bernard bestimmte Wörter oder Muster in der Nachricht oder in Toolergebnissen. Pi sendet diese Inhalte nicht erneut und teilt dem Modell mit der nächsten Nachricht mit, dass sie abgelehnt wurden.`);
+        }
         throw new Error(`Bernard HTTP ${response.status}: ${details}`);
       }
       if (!response.body) throw new Error("Bernard hat keinen Stream zurückgegeben.");
@@ -765,9 +831,20 @@ export default async function (pi: ExtensionAPI) {
   pi.on("model_select", (event) => {
     if (event.model.provider === "bernard" && event.previousModel && event.previousModel.provider !== "bernard") resetThread(true);
   });
-  pi.on("session_before_compact", () => {
+  pi.on("session_before_compact", (event, ctx) => {
     compacting = true;
     temporaryThread = undefined;
+    if (ctx.model?.provider !== "bernard") return;
+    // The summary request packs these messages into one, so `replayable` cannot swap rejected ones
+    // for notes. Pi summarizes this same preparation after the event, so they are swapped here.
+    const { messagesToSummarize, turnPrefixMessages } = event.preparation;
+    const notes = rejectedMessages([...messagesToSummarize, ...turnPrefixMessages] as TranscriptMessage[]);
+    for (const messages of [messagesToSummarize, turnPrefixMessages]) {
+      messages.forEach((message, index) => {
+        const note = notes.get(message as TranscriptMessage);
+        if (note) messages[index] = note as typeof message;
+      });
+    }
   });
   pi.on("session_compact", () => {
     compacting = false;
