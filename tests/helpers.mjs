@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -70,6 +70,9 @@ const jiti = createJiti(import.meta.url, {
 });
 
 export const ai = await jiti.import("@earendil-works/pi-ai/compat");
+/** Pi's classifiers that decide whether a failed reply is retried or triggers compaction. */
+export const { isRetryableAssistantError } = await import(pathToFileURL(join(piAi, "dist", "utils", "retry.js")).href);
+export const { isContextOverflow } = await import(pathToFileURL(join(piAi, "dist", "utils", "overflow.js")).href);
 export const tools = await jiti.import(join(repo, "extensions/bernard/tools.ts"));
 export const session = await jiti.import(join(repo, "extensions/bernard/session.ts"));
 
