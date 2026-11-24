@@ -20,6 +20,7 @@ import type { ExtensionAPI, ExtensionContext, ProviderModelConfig, SessionEntry 
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { bernardToken, hasBernardToken } from "./session.js";
+import { putUpload } from "./upload.js";
 import {
   neutralizeTags,
   renderToolCall,
@@ -475,13 +476,8 @@ async function uploadImage(
   if (!create.ok) throw new Error(`Bernard Bildregistrierung HTTP ${create.status}: ${await errorText(create)}`);
   const created = await create.json() as { presignedPutUrl: string; resource: BernardResource };
   try {
-    const upload = await fetch(created.presignedPutUrl, {
-      method: "PUT",
-      headers: { "Content-Type": created.resource.mimeType },
-      body: bytes,
-      signal,
-    });
-    if (!upload.ok) throw new Error(`Bernard Bild-Upload HTTP ${upload.status}`);
+    const status = await putUpload(created.presignedPutUrl, created.resource.mimeType, bytes, signal);
+    if (status < 200 || status >= 300) throw new Error(`Bernard Bild-Upload HTTP ${status}`);
     const confirm = await authenticatedFetch(`${BASE}/resources/${created.resource._id}/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

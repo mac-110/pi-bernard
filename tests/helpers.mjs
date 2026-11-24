@@ -75,6 +75,7 @@ export const { isRetryableAssistantError } = await import(pathToFileURL(join(piA
 export const { isContextOverflow } = await import(pathToFileURL(join(piAi, "dist", "utils", "overflow.js")).href);
 export const tools = await jiti.import(join(repo, "extensions/bernard/tools.ts"));
 export const session = await jiti.import(join(repo, "extensions/bernard/session.ts"));
+export const upload = await jiti.import(join(repo, "extensions/bernard/upload.ts"));
 
 export const catalog = [
   { _id: "claude-sonnet-4-6", displayName: "Sonnet 4.6", contextWindow: 200000, capabilities: ["functionCalling", "vision"], inputModalities: ["text", "image"], thinking: { modes: ["off", "adaptive"] } },
