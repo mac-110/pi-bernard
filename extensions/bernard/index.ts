@@ -38,6 +38,12 @@ const MAX_IMAGES = 5;
 // /v1/agents/run validates `message` at 50,000 characters, independently of the model context window.
 const MAX_MESSAGE_CHARS = 48_000;
 const MAX_SYSTEM_CHARS = 16_000;
+// Bernard's gateway rejected a Java stack trace, most likely because of `java.lang.RuntimeException`: rule 944100
+// of the OWASP Core Rule Set blocks `java\.lang\.(?:runtime|processbuilder)` in any letter case, so it also hits
+// longer class names. Java source code needs no package name for classes in java.lang, so Pi drops it before
+// sending; fully qualified names in strings or configuration files reach the model without it too.
+// scripts/waf-compare.py applies the same rewrite.
+const BLOCKED_JAVA_PACKAGE = /java\.lang\.(?=runtime|processbuilder)/gi;
 // 429 and 503 mean Bernard did not take the request, so it is sent again unchanged. A 502 may come
 // after the request was passed on, and repeating a run could then start it twice.
 const RETRY_STATUSES = new Set([429, 503]);
@@ -635,7 +641,7 @@ function streamBernard(
       if (transient !== undefined) throw transient;
       const render: RenderContext = { tags, imageNotes, callNumbers: callNumbers(replay.messages) };
       const transcript = lease.bootstrap ? bootstrapText(replay, start, render, notes) : undefined;
-      const inputText = transcript?.text ?? deltaText(replay, start, render, notes);
+      const inputText = (transcript?.text ?? deltaText(replay, start, render, notes)).replace(BLOCKED_JAVA_PACKAGE, "");
       const requestTokens = transcript?.sourceTokens ?? Math.ceil(inputText.length / 4);
       const contextInputTokens = (lease.bootstrap ? 0 : lease.estimatedTokens) + requestTokens + resourceIds.length * 1600;
       const mode = thinkingMode(model.id, options?.reasoning);

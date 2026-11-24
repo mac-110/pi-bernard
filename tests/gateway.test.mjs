@@ -243,3 +243,36 @@ test("/bernard-rejected lists what each rejected request sent, across branches",
   await bernard.commands["bernard-rejected"].handler("", { sessionManager: { getEntries: () => [], getBranch: () => [] }, ui, hasUI: true });
   assert.deepEqual(notes, ["Bernards Gateway hat in dieser Session keine Anfrage abgelehnt."]);
 });
+
+test("java.lang.Runtime and java.lang.ProcessBuilder lose their package name before sending", async () => {
+  // Rule 944100 of the OWASP Core Rule Set, which most likely rejected a Java stack trace.
+  const rule944100 = /java\.lang\.(?:runtime|processbuilder)/i;
+  const bernard = await loadExtension((body) => rule944100.test(body.message)
+    ? gateway403()
+    : sse(reply(["ok"], "stop", `reply-${bernard.runs().length}`)));
+  const trace = [
+    "Caused by: java.lang.RuntimeException: Write failed",
+    "\tat java.base/java.lang.ProcessBuilder.start(ProcessBuilder.java:1143)",
+    "\tat Java.Lang.ProcessBuilder.start",
+    "\tat java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)",
+    "\tat java.base/java.lang.String.valueOf(String.java:4465)",
+  ].join("\n");
+  const context = normalizeContext({ systemPrompt: `${systemPrompt} Never call java.lang.Runtime.exec.`, tools: [readTool], messages: [user(trace)] });
+  const first = await bernard.run(context);
+  assert.equal(first.message.stopReason, "stop", first.message.errorMessage);
+  const sent = bernard.runs()[0].body.message;
+  assert.ok(sent.includes("Never call Runtime.exec."), "system prompt");
+  assert.ok(sent.includes([
+    "Caused by: RuntimeException: Write failed",
+    "\tat java.base/ProcessBuilder.start(ProcessBuilder.java:1143)",
+    "\tat ProcessBuilder.start",
+    "\tat java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)",
+    "\tat java.base/java.lang.String.valueOf(String.java:4465)",
+  ].join("\n")));
+
+  context.messages.push(first.message, user("Runtime.getRuntime() is java.lang.Runtime, not JAVA.LANG.RUNTIME"));
+  const next = await bernard.run(context);
+  assert.equal(next.message.stopReason, "stop", next.message.errorMessage);
+  assert.equal(bernard.runs()[1].body.parentMessageId, "reply-1");
+  assert.equal(bernard.runs()[1].body.message, "[USER]\nRuntime.getRuntime() is Runtime, not RUNTIME");
+});
